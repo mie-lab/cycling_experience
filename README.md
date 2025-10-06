@@ -4,7 +4,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 
 ## 📖 Project Overview
-This project analyzes how environmental factors impact a cyclist's emotional experience (affective response). The workflow uses results from a large online survey to inform a controlled lab study, with a key focus on comparing manually created vs. LLM-generated video descriptions.
+This project analyzes how environmental factors impact a cyclist's emotional experience (affective response). The workflow uses results from a large online survey to inform a controlled lab study, with a key focus on comparing manually created vs. LLM-generated video descriptions for downstream analyses purposes.
 
 The core pipeline is as follows:
 

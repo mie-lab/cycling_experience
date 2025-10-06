@@ -84,13 +84,13 @@ def main():
     # PHASE 4: PROCESS AND ENRICH GEOSPATIAL DATA
     # ==============================================================================
     log.info("Phase 4: Merging Data and Final Clustering")
-    video_geom = pd.read_csv(ground_truth_file)
+    video_ground_truth_features = pd.read_csv(ground_truth_file)
     scaler = MinMaxScaler()
 
     # The selected columns are based on the top negative and positive labels from the survey analysis
-    video_geom[c.DATA_COLS] = scaler.fit_transform(video_geom[c.DATA_COLS])
+    video_ground_truth_features[c.DATA_COLS] = scaler.fit_transform(video_ground_truth_features[c.DATA_COLS])
 
-    data_cluster_df = video_level_scores.merge(video_geom, on=c.VIDEO_ID_COL, how='left')
+    data_cluster_df = video_level_scores.merge(video_ground_truth_features, on=c.VIDEO_ID_COL, how='left')
 
     # Analyze and visualize the correlation between features and target variables
     log.info("Generating full correlation heatmap.")
@@ -129,7 +129,7 @@ def main():
 
     # Isolate the candidate videos (those not used in the survey)
     ids_to_exclude = data_cluster_df[c.VIDEO_ID_COL].unique()
-    candidate_video_df = video_geom.loc[~video_geom[c.VIDEO_ID_COL].isin(ids_to_exclude)]
+    candidate_video_df = video_ground_truth_features.loc[~video_ground_truth_features[c.VIDEO_ID_COL].isin(ids_to_exclude)]
 
     # Predict valence for the candidate videos using the best k
     predicted_valences = utils.clustering_utils.predict_candidates(
