@@ -92,6 +92,7 @@ def get_llm_extracted_features(config: configparser.ConfigParser) -> dict:
             # Add a small delay to respect API rate limits
             time.sleep(1)
 
+    # TODO replace with a csv export
     with open(Path(config["filenames"]["video_info_llm_extraction"]), "w") as f:
         json.dump(all_features, f, indent=2)
 
@@ -152,7 +153,7 @@ def main():
         log.info(f"LLM features file found at '{llm_output_file}'. Skipping extraction.")
     else:
         log.info(f"LLM features file not found. Running feature extraction...")
-        #get_llm_extracted_features(config)
+        get_llm_extracted_features(config)
 
     run_ground_truth_comparison(config)
 
