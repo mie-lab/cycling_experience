@@ -1,3 +1,5 @@
+from typing import Literal
+
 PROJ_CRS = 2056
 BUFFER = 15
 
@@ -118,11 +120,11 @@ LABEL_COLS = [
 ]
 
 DATA_COLS = [
-    'bike_infra_type_numeric',
-    'motorized_traffic_speed_km',
-    'traffic_volume',
-    'average_greenery_share',
-    'car_overtakes_presence'
+    "bike_infra_type_numeric",
+    "motorized_traffic_speed_kmh",
+    "traffic_volume",
+    "average_greenery_share",
+    "motor_vehicle_overtakes_presence"
 ]
 
 TARGET_COL = VALENCE
@@ -205,7 +207,7 @@ TRIAL_4_PLOT_ORDER = [
 
 NUMERIC_FIELDS = [
     "car_lanes_total_count",
-    "bike_lane_width_estimate_meters",
+    "bike_infra_width_estimate_meters",
     "unique_motor_vehicles_count",
     "motorized_traffic_speed_kmh",
     "motor_vehicle_overtakes_count",
@@ -214,11 +216,18 @@ NUMERIC_FIELDS = [
     'average_greenery_share'
 ]
 CATEGORICAL_BOOLEAN_FIELDS = [
-    'surface_material',
-    "slope_type",
+    "surface_material",
     "one_way",
-    'bike_infra_type',
-    "bike_lane_presence",
-    'side_parking_presence',
-    'tram_lane_presence'
+    "bike_infra_type",
+    "bike_infra_presence",
+    "side_parking_presence",
+    "tram_lane_presence",
+    "motor_vehicle_overtakes_presence"
+]
+
+SURFACE_MATERIAL = Literal[
+    "asphalt", "concrete", "gravel", "tiles", "cobblestone", "dirt", "mixed"
+]
+BIKE_LANE_TYPE = Literal[
+    "shared_path", "advisory", "no_bike_infra"
 ]

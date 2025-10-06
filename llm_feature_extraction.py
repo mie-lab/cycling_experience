@@ -5,10 +5,9 @@ from pathlib import Path
 import re
 import pandas as pd
 import configparser
-import constants
+import constants as c
 from utils.segmentation_utils import get_differences, calculate_aggregate_metrics
 from pydantic import BaseModel
-from typing import Literal
 from google import genai
 
 # --- Basic Setup ---
@@ -16,19 +15,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 
-SURFACE_MATERIAL = Literal[
-    "asphalt", "concrete", "gravel", "tiles", "cobblestone", "dirt", "mixed"
-]
-BIKE_LANE_TYPE = Literal[
-    "shared_path", "advisory", "no_bike_infra"
-]
-
-
 class VideoFeatures(BaseModel):
-    surface_material: SURFACE_MATERIAL
+    surface_material: c.SURFACE_MATERIAL
     car_lanes_total_count: int
     one_way: bool
-    bike_lane_type: BIKE_LANE_TYPE
+    bike_lane_type: c.BIKE_LANE_TYPE
     bike_lane_presence: bool
     bike_lane_width_estimate_meters: float
     side_parking_presence: bool
@@ -44,7 +35,7 @@ class VideoFeatures(BaseModel):
 
 def get_llm_extracted_features(config: configparser.ConfigParser) -> dict:
     try:
-        api_key = Path(config["filenames"]["gemini_api_key"]).read_text().strip()
+        api_key = Path(config["models"]["gemini_api_key"]).read_text().strip()
         video_candidates_path = Path(config["paths"]["video_candidates_path"])
         prompt_file = Path(config["filenames"]["prompt_file"])
         client = genai.Client(api_key=api_key)
@@ -125,7 +116,7 @@ def run_ground_truth_comparison(config: configparser.ConfigParser) -> None:
         log.info(f"Successfully transformed {len(predictions_dict)} prediction keys.")
 
         ground_truth_df = pd.read_csv(ground_truth_path)
-        ground_truth_dict = ground_truth_df.set_index(constants.VIDEO_ID_COL).to_dict(orient='index')
+        ground_truth_dict = ground_truth_df.set_index(c.VIDEO_ID_COL).to_dict(orient='index')
 
         detailed_results, common_videos, numerical_fields, _ = get_differences(predictions_dict, ground_truth_dict)
 
@@ -161,7 +152,7 @@ def main():
         log.info(f"LLM features file found at '{llm_output_file}'. Skipping extraction.")
     else:
         log.info(f"LLM features file not found. Running feature extraction...")
-        get_llm_extracted_features(config)
+        #get_llm_extracted_features(config)
 
     run_ground_truth_comparison(config)
 

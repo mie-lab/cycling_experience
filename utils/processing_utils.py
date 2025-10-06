@@ -606,7 +606,7 @@ def enrich_with_spatial_data(
 
     # Centralize all file path definitions from the config
     paths = {
-        "overtakes": Path(config["filenames"]["manual_labelling_file"]),
+        "manual_labels": Path(config["filenames"]["manual_labelling_file"]),
         "bike_network": Path(config["filenames"]["bike_network_file"]),
         "traffic_volume": Path(config["filenames"]["traffic_volume_file"]),
         "road_network": Path(config["filenames"]["road_network_file"]),
@@ -632,9 +632,9 @@ def enrich_with_spatial_data(
 
     # --- 3. MERGE OVERTAKES DATA ---
     log.info("Enriching with overtake data...")
-    overtakes = pd.read_excel(paths["overtakes"])
-    enriched_geom = enriched_geom.merge(overtakes, on=c.VIDEO_ID_COL, how='left').fillna({'car_overtakes': 0})
-    enriched_geom['car_overtakes_presence'] = enriched_geom['car_overtakes'] > 0
+    overtakes = pd.read_excel(paths["manual_labels"])
+    enriched_geom = enriched_geom.merge(overtakes, on=c.VIDEO_ID_COL, how='left').fillna({"motor_vehicle_overtakes_count": 0})
+    enriched_geom["motor_vehicle_overtakes_presence"] = enriched_geom["motor_vehicle_overtakes_count"] > 0
 
     # --- 4. MERGE TRAFFIC VOLUME ---
     log.info("Enriching with traffic volume data...")
@@ -651,7 +651,7 @@ def enrich_with_spatial_data(
     speed_limits['temporegime_technical'] = pd.to_numeric(
         speed_limits['temporegime_technical'].str.extract(r'(\d+)', expand=False), errors='coerce'
     ).astype(int)
-    enriched_geom = merge_spatial_attribute(buffer_geom, enriched_geom, speed_limits, 'temporegime_technical', 'motorized_traffic_speed_km')
+    enriched_geom = merge_spatial_attribute(buffer_geom, enriched_geom, speed_limits, 'temporegime_technical', 'motorized_traffic_speed_kmh')
 
     # Tram Lanes: Explicitly read only the necessary column
     tram_lanes = gpd.read_file(road_network_path, layer='vas.vas_verkehrstraeger_event', columns=['tram_vorhanden'])
@@ -663,7 +663,7 @@ def enrich_with_spatial_data(
     enriched_geom = merge_spatial_boolean(buffer_geom, enriched_geom, one_way_lanes, 'one_way', 'length', threshold=20)
 
     # Fill NaNs and explicitly set the final data type for each column individually.
-    enriched_geom['motorized_traffic_speed_km'] = enriched_geom['motorized_traffic_speed_km'].fillna(0).astype(int)
+    enriched_geom['motorized_traffic_speed_kmh'] = enriched_geom['motorized_traffic_speed_kmh'].fillna(0).astype(int)
     enriched_geom['tram_lane_presence'] = enriched_geom['tram_lane_presence'].fillna(False).astype(bool)
 
     # --- 6. MERGE SIDE PARKING PRESENCE ---
