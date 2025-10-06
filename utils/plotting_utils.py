@@ -402,7 +402,7 @@ def plot_candidate_predictions(
     """
 
     cmap = plt.get_cmap('viridis')
-    figsize = (8, 4)
+    figsize = (10, 4)
     video_ids = df[id_col].astype(str)
     predictions = df['valence_prediction']
     error_margin = best_rmse

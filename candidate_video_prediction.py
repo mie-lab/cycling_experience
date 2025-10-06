@@ -29,10 +29,10 @@ def main():
     # ==============================================================================
     # PHASE 1: LOAD DATA
     # ==============================================================================
-    survey_results_file_name = Path(config["filenames"]["survey_results_file_name"])
-    sequence_file_name = Path(config["filenames"]["online_sequence_file_name"])
-    predicted_valences_file_name = Path(config['filenames']['video_predictions'])
-    ground_truth_file = Path(config["paths"]["output_dir"]) / "ground_truth_features.csv"
+    survey_results_file = Path(config["filenames"]["survey_results_file"])
+    sequence_file = Path(config["filenames"]["online_sequence_file"])
+    predicted_valences_file = Path(config['filenames']['video_predictions_file'])
+    ground_truth_file = Path(config["filenames"]["video_info_ground_truth"])
     output_dir = Path(config['paths']['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -40,8 +40,8 @@ def main():
     # PHASE 2: PROCESS SURVEY DATA
     # ==============================================================================
     log.info("Phase 2: Processing Survey Data")
-    survey_df = pd.read_excel(survey_results_file_name).set_index(c.PARTICIPANT_ID)
-    seq_df = pd.read_csv(sequence_file_name, parse_dates=['seq_start', 'seq_end'])
+    survey_df = pd.read_excel(survey_results_file).set_index(c.PARTICIPANT_ID)
+    seq_df = pd.read_csv(sequence_file, parse_dates=['seq_start', 'seq_end'])
 
     # Transform survey responses into a long format
     survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
@@ -123,6 +123,7 @@ def main():
     log.info("Phase 5: Running Predictive Model")
     X = data_cluster_df[c.DATA_COLS].copy()
 
+    # TODO - consider predicting valence AND arousal jointly
     # Find the optimal number of neighbors (k) for the predictive model
     rmses_df, best_rmse, best_k = utils.clustering_utils.compute_k_rmse(X, data_cluster_df, c.TARGET_COL)
 
@@ -150,8 +151,8 @@ def main():
         save_path=output_dir / "Candidate videos valence predictions.png")
 
     # Save the numerical predictions to a CSV file
-    log.info(f"Saving predictions to {predicted_valences_file_name}")
-    predicted_valences.to_csv(predicted_valences_file_name, index=False)
+    log.info(f"Saving predictions to {predicted_valences_file}")
+    predicted_valences.to_csv(predicted_valences_file, index=False)
 
     log.info("Analysis pipeline finished successfully!")
 

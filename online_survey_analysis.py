@@ -26,8 +26,8 @@ def main():
     config.read("config.ini")
 
     # --- Load file paths and define directories ---
-    survey_results_file_name = Path(config["filenames"]["survey_results_file_name"])
-    sequence_file_name = Path(config["filenames"]["online_sequence_file_name"])
+    survey_results_file = Path(config["filenames"]["survey_results_file"])
+    sequence_file = Path(config["filenames"]["online_sequence_file"])
     output_dir = Path(config['paths']['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -35,8 +35,8 @@ def main():
     # PHASE 1: LOAD & PREPROCESS DATA
     # ==============================================================================
     log.info("Loading and preprocessing data...")
-    survey_df = pd.read_excel(survey_results_file_name).set_index(c.PARTICIPANT_ID)
-    seq_df = pd.read_csv(sequence_file_name, parse_dates=['seq_start', 'seq_end'])
+    survey_df = pd.read_excel(survey_results_file).set_index(c.PARTICIPANT_ID)
+    seq_df = pd.read_csv(sequence_file, parse_dates=['seq_start', 'seq_end'])
 
     # Transform survey responses into a long format
     survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
@@ -156,7 +156,7 @@ def main():
                 ]
 
     for formula in formulas:
-        dependent_var = formula.split(' ')[0]  # Extracts the outcome (e.g., 'valence')
+        dependent_var = formula.split(' ')[0]
         log.info(f"\n--- Analyzing Effect of Familiarity on: {dependent_var.upper()} ---")
 
         # --- Step 1: Fit the Baseline Model for this outcome ---

@@ -23,14 +23,14 @@ def main():
     config = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
     config.read("config.ini")
 
-    online_results_file = Path(config["filenames"]["survey_results_file_name"])
-    online_sequence_file = Path(config["filenames"]["online_sequence_file_name"])
+    online_results_file = Path(config["filenames"]["survey_results_file"])
+    online_sequence_file = Path(config["filenames"]["online_sequence_file"])
 
-    video_predictions_file = Path(config["filenames"]["video_predictions"])
+    video_predictions_file = Path(config["filenames"]["video_predictions_file"])
 
-    lab_results_file = Path(config["filenames"]["lab_study_results"])
-    lab_sequence_file = Path(config['filenames']['lab_video_sequence_file_name'])
-    lab_setup_file = Path(config['filenames']['lab_experiment_setup_file_name'])
+    lab_results_file = Path(config["filenames"]["lab_study_results_file"])
+    lab_sequence_file = Path(config['filenames']['lab_video_sequence_file'])
+    lab_setup_file = Path(config['filenames']['lab_experiment_setup_file'])
 
     # Define and create the output directory.
     output_dir = Path(config['paths']['output_dir'])
@@ -58,7 +58,7 @@ def main():
     survey_results_df = utils.processing_utils.assign_affective_states(survey_results_df)
 
     # Aggregate individual ratings to get a single summary score per video.
-    # TODO: check how the function differ from aggregate_video_level_scores
+    # TODO: doublecheck how the function differ from aggregate_video_level_scores
     online_video_level_scores = utils.processing_utils.calculate_video_level_scores(
         survey_results_df, rating_col=c.AG
     ).rename(columns={c.VALENCE: 'valence_online', c.AROUSAL: 'arousal_online'})
