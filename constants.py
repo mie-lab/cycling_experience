@@ -28,20 +28,22 @@ CYCL_ENV = 'Cycling_environment'
 GENDER_ORDER = [
     'Female',
     'Male'
-]
+    ]
 
+# aggregated categories to ensure sufficient sample size in each group
 AGE_ORDER = [
     "18 - 25 years",
     "26 - 35 years",
     "36 - 45 years",
-    "46+ years" #  aggregated to ensure sufficient sample size in each group
-]
+    "46+ years"  # combines '46 - 55 years', '56 - 65 years', '+65 years'
+    ]
 
+# aggregated categories to ensure sufficient sample size in each group
 CYCL_FREQ_ORDER = [
-    'Infrequent',  # less than once a month
-    'Occasional',  # at least once a month
-    'Regular',  # at least three times a week
-]
+    'Infrequent',  # combines "Never", "Less than once a month",
+    'Occasional',  # combines "1-3 times/month", "1-2 days/week"
+    'Regular',  # combines "3-4 days/week", "5-6 days/week", "Every day"
+    ]
 
 CYCL_PURP_ORDER = [
     'Commuting (e.g., work, school)',
@@ -49,20 +51,20 @@ CYCL_PURP_ORDER = [
     'Exercise / fitness',
     'All purposes',
     'I do not cycle'
-]
+    ]
 
 CYCL_ENV_ORDER = [
     'Urban area',
     'Rural area',
     'Both',
     'I do not cycle'
-]
+    ]
 
-# categories that could be centered
+# aggregated categories to ensure sufficient sample size in each group
 CYCL_CONF_ORDER = [
-    'Confident',
-    'Not confident'
-]
+    'Confident',  # combines 'Very confident' and 'Somewhat confident'
+    'Not confident'  # combines 'Slightly not confident', 'Not confident at all'
+    ]
 
 FAM_ORDER = [
     'Not at all familiar',
@@ -70,7 +72,7 @@ FAM_ORDER = [
     'Equally familiar and unfamiliar',
     'Somewhat familiar',
     'Extremely familiar'
-]
+    ]
 
 OE_ORDER = [
     'Very negative',
@@ -80,10 +82,15 @@ OE_ORDER = [
     'Somewhat positive',
     'Positive',
     'Very positive'
-]
+    ]
 
 AFFECTIVE_STATES = ['Tension', 'Activation', 'Contentment', 'Deactivation']
+
 DEPENDENT_VARIABLES = (VALENCE, AROUSAL)
+
+# We focus on valence as the primary target variable
+TARGET_COL = VALENCE
+
 DEMOGRAPHIC_COLUMNS = [GENDER, AGE, CYCL_FREQ, CYCL_PURP, CYCL_CONF, CYCL_ENV]
 
 CATEGORY_ORDERS = {
@@ -126,14 +133,41 @@ DATA_COLS = [
     "average_greenery_share",
     "motor_vehicle_overtakes_presence"
 ]
+NUMERIC_FIELDS = [
+    "car_lanes_total_count",
+    "bike_infra_width_estimate_meters",
+    "unique_motor_vehicles_count",
+    "motorized_traffic_speed_kmh",
+    "motor_vehicle_overtakes_count",
+    "unique_cyclists_count",
+    "unique_pedestrians_count",
+    'average_greenery_share'
+]
+CATEGORICAL_BOOLEAN_FIELDS = [
+    "surface_material",
+    "one_way",
+    "bike_infra_type",
+    "bike_infra_presence",
+    "side_parking_presence",
+    "tram_lane_presence",
+    "motor_vehicle_overtakes_presence"
+]
 
-TARGET_COL = VALENCE
+SURFACE_MATERIAL = Literal[
+    "asphalt", "concrete", "gravel", "tiles", "cobblestone", "dirt", "mixed"
+]
+BIKE_LANE_TYPE = Literal[
+    "shared_path", "advisory", "no_bike_infra"
+]
+
+# Trial-specific constants
 VIDEO_COUNTS = {
     'DJI': 10,
     '2': 8,
     '3': 8,
     '4': 8
 }
+
 TRIAL_1 = 'DJI'
 
 TRIAL_2_PARAMS = {
@@ -205,29 +239,3 @@ TRIAL_4_PLOT_ORDER = [
     'NB → NB → B'  # Outlier 'B' at position 3
 ]
 
-NUMERIC_FIELDS = [
-    "car_lanes_total_count",
-    "bike_infra_width_estimate_meters",
-    "unique_motor_vehicles_count",
-    "motorized_traffic_speed_kmh",
-    "motor_vehicle_overtakes_count",
-    "unique_cyclists_count",
-    "unique_pedestrians_count",
-    'average_greenery_share'
-]
-CATEGORICAL_BOOLEAN_FIELDS = [
-    "surface_material",
-    "one_way",
-    "bike_infra_type",
-    "bike_infra_presence",
-    "side_parking_presence",
-    "tram_lane_presence",
-    "motor_vehicle_overtakes_presence"
-]
-
-SURFACE_MATERIAL = Literal[
-    "asphalt", "concrete", "gravel", "tiles", "cobblestone", "dirt", "mixed"
-]
-BIKE_LANE_TYPE = Literal[
-    "shared_path", "advisory", "no_bike_infra"
-]

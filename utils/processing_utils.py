@@ -4,7 +4,7 @@ from typing import Any
 import re
 import ast
 import numpy as np
-from shapely import LineString, box
+from shapely import LineString
 import pandas as pd
 import geopandas as gpd
 from typing import List, Union
@@ -89,6 +89,7 @@ def filter_aggregate_results(
     """
     df = df.copy()
     if c.AG in df.columns:
+        # small correction for a few participants that typed 0 instead of 1
         df.loc[df[c.AG].eq(0), c.AG] = 1
 
     mask = pd.Series(True, index=df.index)
@@ -108,10 +109,13 @@ def filter_aggregate_results(
 
     # if upward aggregation needed to gain some significance power
     if age:
-        groups_to_combine = ['46 - 55 years', '56 - 65 years', '+65 years']
-        new_group_name = '46+ years'
+        age_lookup = {
+            '46 - 55 years': '46+ years',
+            '56 - 65 years': '46+ years',
+            '+65 years': '46+ years'
+        }
 
-        df[c.AGE] = df[c.AGE].replace(groups_to_combine, new_group_name)
+        df[c.AGE] = df[c.AGE].replace(age_lookup)
 
     if gender:
         mask &= df[c.GENDER].isin(['Male', 'Female'])
@@ -125,9 +129,9 @@ def filter_aggregate_results(
         frequency_lookup = {
             "Never": "Infrequent",
             "Less than once a month": "Infrequent",
-            "1-3 times/month": "Infrequent",
+            "1-3 times/month": "Occasional",
             "1-2 days/week": "Occasional",
-            "3-4 days/week": "Occasional",
+            "3-4 days/week": "Regular",
             "5-6 days/week": "Regular",
             "Every day": "Regular"
         }

@@ -1,13 +1,12 @@
 from collections import Counter
 import pandas as pd
+import re
 from scipy.stats import pearsonr, spearmanr
 import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy import stats
 import constants as c
 import utils.processing_utils
-
-
 
 
 def get_trial_dict(study_results, experiment_setup, trial_label, trial_video_counts):
@@ -50,6 +49,7 @@ def get_trial_dict(study_results, experiment_setup, trial_label, trial_video_cou
 
     return trial_dict
 
+
 def trial_dict_to_df(trial_dict):
     """
     Converts a trial dictionary to a DataFrame.
@@ -61,10 +61,11 @@ def trial_dict_to_df(trial_dict):
         rank_map = {fname: r for fname, r in data.get('ranks', [])}
 
         for fname, rating in data['ratings']:
-            #print(fname, rating)
+            match = re.search(r'video_(\d+)', fname)
+            video_id_num = int(match.group(1)) if match else None
             row = {
                 'participant_id': pid,
-                'video_id': fname,
+                'video_id': video_id_num,
                 'rating': int(rating),
             }
             if 'ranks' in data:

@@ -47,13 +47,15 @@ def main():
     survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, online_seq_df, id_col=c.PARTICIPANT_ID)
 
     # Clean and preprocess the survey response data
-    survey_results_df = utils.processing_utils.filter_aggregate_results(survey_results_df,
-                                                                        age=True,
-                                                                        gender=True,
-                                                                        by_country=True,
-                                                                        cycling_environment=True,
-                                                                        cycling_frequency=True,
-                                                                        cycling_confidence=True)
+    survey_results_df = utils.processing_utils.filter_aggregate_results(
+        survey_results_df,
+        age=True,
+        gender=True,
+        by_country=True,
+        cycling_environment=True,
+        cycling_frequency=True,
+        cycling_confidence=True
+    )
     survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
     survey_results_df = utils.processing_utils.assign_affective_states(survey_results_df)
 
@@ -65,25 +67,28 @@ def main():
 
     log.info('Phase 2.2: Loading and Processing Lab Study Data')
     lab_results_df = pd.read_excel(lab_results_file).set_index(c.PARTICIPANT_ID, drop=True)
-    lab_results_df = utils.processing_utils.filter_aggregate_results(lab_results_df,
-                                                                     consent=False,
-                                                                     duration=False,
-                                                                     location=False,
-                                                                     gender=True,
-                                                                     cycling_environment=True,
-                                                                     cycling_frequency=True,
-                                                                     cycling_confidence=True)
+    lab_results_df = utils.processing_utils.filter_aggregate_results(
+        lab_results_df,
+        consent=False,
+        duration=False,
+        location=False,
+        gender=True,
+        cycling_environment=True,
+        cycling_frequency=True,
+        cycling_confidence=True
+    )
 
-    participant_demo = lab_results_df[c.DEMOGRAPHIC_COLUMNS]
+    demographics_df = lab_results_df[c.DEMOGRAPHIC_COLUMNS]
 
     lab_seq_df = pd.read_csv(lab_sequence_file)
     experiment_setup = pd.read_csv(lab_setup_file, header=None).set_index(0, drop=True)
 
-    # Isolate rating columns by dropping metadata and demographics.
-    cols_to_drop = ['start', 'end'] + c.DEMOGRAPHIC_COLUMNS
-    lab_results_df = lab_results_df.drop(columns=cols_to_drop)
-    lab_results_df = lab_results_df.replace(r'^\s*(\d+).*$', r'\1', regex=True)
-    lab_results_df = lab_results_df.apply(pd.to_numeric, errors='coerce')
+    lab_results_df = (
+        lab_results_df
+        .drop(columns=c.DEMOGRAPHIC_COLUMNS + [c.START, c.END])
+        .replace(r'^\s*(\d+).*$', r'\1', regex=True)
+        .apply(pd.to_numeric, errors='coerce')
+    )
 
     log.info('Phase 2.3: Loading and Processing Video Prediction Data')
     video_score_predictions = pd.read_csv(video_predictions_file)
@@ -93,10 +98,13 @@ def main():
     # ==============================================================================
 
     log.info("\n--- Block 1 Analysis ---")
-    df_baseline = utils.helper_functions.get_trial_dict(lab_results_df, experiment_setup, c.TRIAL_1, c.VIDEO_COUNTS)
+    df_baseline = utils.helper_functions.get_trial_dict(
+        lab_results_df,
+        experiment_setup,
+        c.TRIAL_1,
+        c.VIDEO_COUNTS
+    )
     df1 = utils.helper_functions.trial_dict_to_df(df_baseline)
-
-    df1[c.VIDEO_ID_COL] = (df1[c.VIDEO_ID_COL].str.extract(r'video_(\d+)', expand=False).astype(int))
     df1 = utils.processing_utils.add_valence_arousal(df1, 'rating')
 
     # Aggregate individual ratings to get a single summary score per video.
@@ -142,7 +150,7 @@ def main():
         c.TRIAL_2_PARAMS,
         video_level_scores
     )
-    df_equal = pd.merge(df_equal, participant_demo, on=c.PARTICIPANT_ID, how='left')
+    df_equal = pd.merge(df_equal, demographics_df, on=c.PARTICIPANT_ID, how='left')
 
     file_name = output_dir / 'trial_2_overall_ratings.png'
     utils.plotting_utils.plot_violin_panels(
@@ -168,7 +176,7 @@ def main():
         video_level_scores,
         'NB'
     )
-    df_positive = pd.merge(df_positive, participant_demo, on=c.PARTICIPANT_ID, how='left')
+    df_positive = pd.merge(df_positive, demographics_df, on=c.PARTICIPANT_ID, how='left')
 
     # --- 2. Generate and Save Visualizations ---
     ratings_plot_path = output_dir / 'trial_2_overall_ratings.png'
@@ -201,7 +209,7 @@ def main():
         video_level_scores,
         'B'
     )
-    df_negative = pd.merge(df_negative, participant_demo, on=c.PARTICIPANT_ID, how='left')
+    df_negative = pd.merge(df_negative, demographics_df, on=c.PARTICIPANT_ID, how='left')
 
     # --- 2. Generate and Save Visualizations ---
     ratings_plot_path = output_dir / 'trial_4_overall_ratings.png'
