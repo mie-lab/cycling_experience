@@ -14,7 +14,7 @@ def get_trial_dict(study_results, experiment_setup, trial_label, trial_video_cou
     Extracts ratings and rankings for a specific trial from study results and experiment setup.
     :param study_results: DataFrame with study results
     :param experiment_setup: DataFrame with experiment setup
-    :param trial_label: label of the trial to extract (e.g., 'DJI', '2', '3')
+    :param trial_label: label of the trial to extract (e.g., 'DJI', '2', '3', '4')
     :param trial_video_counts: dict with number of videos per trial
     :return: Dictionary with participant IDs as keys and their ratings/rankings as values
     """
@@ -61,11 +61,12 @@ def trial_dict_to_df(trial_dict):
         rank_map = {fname: r for fname, r in data.get('ranks', [])}
 
         for fname, rating in data['ratings']:
-            match = re.search(r'video_(\d+)', fname)
-            video_id_num = int(match.group(1)) if match else None
+            if 'DJI' in fname:
+                match = re.search(r'video_(\d+)', fname)
+                fname = int(match.group(1)) if match else None
             row = {
                 'participant_id': pid,
-                'video_id': video_id_num,
+                'video_id': fname,
                 'rating': int(rating),
             }
             if 'ranks' in data:
