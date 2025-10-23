@@ -240,7 +240,6 @@ def main():
     log.info("--- Analyzing [Equal Scenario]: Does spoiler position matter in 50/50 case? ---")
     df_equal['NB_count'] = df_equal['sequence_list'].apply(lambda seq: seq.count('NB'))
     formula = "valence ~ C(NB_position)"
-
     utils.lmm_utils.run_lmm(
         df=df_equal[df_equal['NB_count'] < 2],  # filter for sequences with only one spoiler to isolate the effect.
         formula=formula,
@@ -257,17 +256,59 @@ def main():
         convergence_method='cg'
     )
 
-    # Formula with demographic interaction
-    formula = "valence ~ C(B_position) * C(Gender)"  # change this to test other demographics
-    neg_scenario_model_complex = utils.lmm_utils.run_lmm(
+    formula = "valence ~ C(B_position) * C(Gender)"
+    neg_scenario_model_gender = utils.lmm_utils.run_lmm(
         df=df_negative,
         formula=formula,
         groups_col=c.PARTICIPANT_ID,
         convergence_method='cg'
     )
 
-    # compare simple and more complex mixed-effects models
-    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_complex, mixture=False)
+    formula = "valence ~ C(B_position) * C(Age)"
+    neg_scenario_model_age = utils.lmm_utils.run_lmm(
+        df=df_negative,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    formula = "valence ~ C(B_position) * C(Cycling_confidence)"
+    neg_scenario_model_confidence = utils.lmm_utils.run_lmm(
+        df=df_negative,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    formula = "valence ~ C(B_position) * C(Cycling_frequency)"
+    neg_scenario_model_frequency = utils.lmm_utils.run_lmm(
+        df=df_negative,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    formula = "valence ~ C(B_position) * C(Cycling_purpose)"
+    neg_scenario_model_purpose = utils.lmm_utils.run_lmm(
+        df=df_negative,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    formula = "valence ~ C(B_position) * C(Cycling_environment)"
+    neg_scenario_model_environment = utils.lmm_utils.run_lmm(
+        df=df_negative,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_gender, mixture=False)
+    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_age, mixture=False)
+    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_confidence, mixture=False)
+    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_frequency, mixture=False)
+    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_purpose, mixture=False)
+    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_environment, mixture=False)
 
     log.info("--- Analyzing [Positive Scenario]: Does spoiler position impact a mostly positive experience? ---")
     formula = "valence ~ C(NB_position)"
@@ -278,17 +319,60 @@ def main():
         convergence_method='cg'
     )
 
-    # Formula with demographic interaction
-    formula = "valence ~ C(NB_position) + C(Gender)"  # change this to test other demographics
-    pos_scenario_model_complex = utils.lmm_utils.run_lmm(
+    formula = "valence ~ C(NB_position) * C(Gender)"
+    pos_scenario_model_gender = utils.lmm_utils.run_lmm(
         df=df_positive,
         formula=formula,
         groups_col=c.PARTICIPANT_ID,
         convergence_method='cg'
     )
 
-    # compare simple and more complex mixed-effects models
-    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_complex, mixture=False)
+    formula = "valence ~ C(NB_position) * C(Age)"
+    pos_scenario_model_age = utils.lmm_utils.run_lmm(
+        df=df_positive,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    formula = "valence ~ C(NB_position) * C(Cycling_confidence)"
+    pos_scenario_model_confidence = utils.lmm_utils.run_lmm(
+        df=df_positive,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    formula = "valence ~ C(NB_position) * C(Cycling_frequency)"
+    pos_scenario_model_frequency = utils.lmm_utils.run_lmm(
+        df=df_positive,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    formula = "valence ~ C(NB_position) * C(Cycling_purpose)"
+    pos_scenario_model_purpose = utils.lmm_utils.run_lmm(
+        df=df_positive,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    formula = "valence ~ C(NB_position) * C(Cycling_environment)"
+    pos_scenario_model_environment = utils.lmm_utils.run_lmm(
+        df=df_positive,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_gender, mixture=False)
+    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_age, mixture=False)
+    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_confidence, mixture=False)
+    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_frequency, mixture=False)
+    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_purpose, mixture=False)
+    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_environment, mixture=False)
 
     # ------------------------------------------------------------------------------
     # Part 2: Combined Analysis - Building More Complex Models
@@ -299,45 +383,96 @@ def main():
     # --- Model 1: Main Effects Model ---
     log.info("--- Model 1: Testing Main Effects of Position and Scenario ---")
     log.info("RQ: Do spoiler position and scenario each have an independent effect on valence?")
-    formula_1 = "valence ~ C(spoiler_position) + C(scenario)"
+    formula = "valence ~ C(spoiler_position) + C(scenario)"
     model_1_additive = utils.lmm_utils.run_lmm(
         df=df_combined,
-        formula=formula_1,
+        formula=formula,
         groups_col=c.PARTICIPANT_ID,
         convergence_method='cg'
     )
 
-    # --- Model 2: Interaction Model ---
     log.info("--- Model 2: Do spoiler position and scenario interact? ---")
     log.info("RQ: Does the effect of a spoiler's position on overall valence DEPEND on scenario (positive/negative)?")
-    formula_2 = "valence ~ C(spoiler_position) * C(scenario)"
+    formula = "valence ~ C(spoiler_position) * C(scenario)"
     model_2_interactive = utils.lmm_utils.run_lmm(
         df=df_combined,
-        formula=formula_2,
+        formula=formula,
         groups_col=c.PARTICIPANT_ID,
         convergence_method='cg'
     )
 
-    # --- Model 3: Interaction Model with Random Slopes ---
     log.info("--- Model 3: Adding individual sensitivity (Random Slopes) ---")
     log.info("RQ: Do participants vary in their sensitivity to spoiler position?")
-    formula_3 = "valence ~ C(spoiler_position) * C(scenario)"
+    formula = "valence ~ C(spoiler_position) * C(scenario)"
     re_formula_3 = "~ spoiler_position"
     model_3_slopes = utils.lmm_utils.run_lmm(
         df=df_combined,
-        formula=formula_3,
+        formula=formula,
         re_formula=re_formula_3,
         groups_col=c.PARTICIPANT_ID,
         convergence_method='cg'
     )
 
-    # --- Model 4: Three-Way Interaction Model (Moderation) ---
     log.info("--- Model 4: Does gender moderate the interaction effect? ---")
     log.info("RQ: Is the interaction between spoiler position and scenario different for different environments?")
-    formula_4 = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_environment)"
+    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_environment)"
     model_4_moderation = utils.lmm_utils.run_lmm(
         df=df_combined,
-        formula=formula_4,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    log.info("--- Model 5: Does gender moderate the interaction effect? ---")
+    log.info("RQ: Is the interaction between spoiler position and scenario different for different cycling confidences?")
+    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_confidence)"
+    model_5_moderation = utils.lmm_utils.run_lmm(
+        df=df_combined,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    # --- Model 6: Three-Way Interaction Model (Moderation) ---
+    log.info("--- Model 6: Does gender moderate the interaction effect? ---")
+    log.info("RQ: Is the interaction between spoiler position and scenario different for different cycling frequences?")
+    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_frequency)"
+    model_6_moderation = utils.lmm_utils.run_lmm(
+        df=df_combined,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    # --- Model 7: Three-Way Interaction Model (Moderation) ---
+    log.info("--- Model 7: Does gender moderate the interaction effect? ---")
+    log.info("RQ: Is the interaction between spoiler position and scenario different for different cycling purposes?")
+    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_purpose)"
+    model_7_moderation = utils.lmm_utils.run_lmm(
+        df=df_combined,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    # --- Model 8: Three-Way Interaction Model (Moderation) ---
+    log.info("--- Model 8: Does gender moderate the interaction effect? ---")
+    log.info("RQ: Is the interaction between spoiler position and scenario different for different Genders?")
+    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Gender)"
+    model_8_moderation = utils.lmm_utils.run_lmm(
+        df=df_combined,
+        formula=formula,
+        groups_col=c.PARTICIPANT_ID,
+        convergence_method='cg'
+    )
+
+    # --- Model 9: Three-Way Interaction Model (Moderation) ---
+    log.info("--- Model 9: Does gender moderate the interaction effect? ---")
+    log.info("RQ: Is the interaction between spoiler position and scenario different for different Age groups?")
+    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Gender)"
+    model_9_moderation = utils.lmm_utils.run_lmm(
+        df=df_combined,
+        formula=formula,
         groups_col=c.PARTICIPANT_ID,
         convergence_method='cg'
     )
@@ -347,17 +482,29 @@ def main():
     # ------------------------------------------------------------------------------
     log.info("\n--- Running sequential model comparisons ---")
 
-    # --- Test 1: Justifying the Interaction ---
     log.info("\n--- Comparison: Model 1 (Main Effects) vs. Model 2 (Interaction) ---")
     utils.lmm_utils.lr_test_mixed(model_1_additive, model_2_interactive)
 
-    # --- Test 2: Justifying Random Slopes ---
     log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 3 (Random Slopes) ---")
     utils.lmm_utils.lr_test_mixed(model_2_interactive, model_3_slopes)
 
-    # --- Test 3: Justifying Moderation by Gender ---
     log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 4 (Moderation) ---")
     utils.lmm_utils.lr_test_mixed(model_2_interactive, model_4_moderation)
+
+    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 5 (Moderation) ---")
+    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_5_moderation)
+
+    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 6 (Moderation) ---")
+    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_6_moderation)
+
+    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 7 (Moderation) ---")
+    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_7_moderation)
+
+    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 8 (Moderation) ---")
+    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_8_moderation)
+
+    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 9 (Moderation) ---")
+    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_9_moderation)
 
     # ------------------------------------------------------------------------------
     # Part 4: Testing Alternative Explanations
@@ -383,7 +530,7 @@ def main():
         formula=formula,
         groups_col=c.PARTICIPANT_ID,
         re_formula=re_formula,
-        convergence_method='lbfgs'
+        convergence_method='powell'
     )
 
     # ==============================================================================
