@@ -318,3 +318,63 @@ def analyze_segment(eda_df, ppg_df, sampling_rate):
         metrics.update({'Heart_Rate_Mean': np.nan, 'HRV_RMSSD': np.nan, 'HRV_SD1': np.nan})
 
     return metrics
+
+
+def map_physiological_segments_to_videos(physio_df, experiment_setup, trial_label, video_counts):
+    """
+    Map physiological segments to the correct video filenames (e.g., DJI videos)
+    based on the experiment setup, following the same order logic as get_trial_dict().
+    Handles missing/broken physiological segments gracefully.
+    """
+    mapped = []
+    n_total = video_counts[trial_label]
+    physio_df[c.PARTICIPANT_ID] = physio_df[c.PARTICIPANT_ID].astype('Int64')
+    experiment_setup.index = experiment_setup.index.astype('Int64')
+
+    for pid in physio_df[c.PARTICIPANT_ID].unique():
+        if pid not in experiment_setup.index:
+            continue
+
+        setup_row = experiment_setup.loc[pid]
+        trial_order = list(dict.fromkeys(fn.split('_')[0] for fn in setup_row if pd.notna(fn)))
+        if trial_label not in trial_order:
+            continue
+
+        # Find column range for this trial
+        idx = trial_order.index(trial_label)
+        col_start = int(sum(video_counts[t] for t in trial_order[:idx]) / 2)
+        col_end = col_start + n_total
+
+        # Extract only valid DJI videos
+        trial_files = setup_row.iloc[col_start:col_end].dropna().tolist()
+        dji_files = [f for f in trial_files if isinstance(f, str) and f.upper().startswith("DJI")]
+
+        # Physiological segments for this participant
+        pid_physio = physio_df[physio_df[c.PARTICIPANT_ID] == pid].sort_values('segment_id')
+        n_physio = len(pid_physio)
+        n_videos = len(dji_files)
+
+        if n_physio == 0:
+            logging.warning(f"Participant {pid}: no physiological data found.")
+            continue
+
+        if n_physio != n_videos:
+            logging.warning(
+                f"Participant {pid}: Missing — {n_physio} physio segments from {n_videos} videos. "
+                f"Mapping only first {min(n_physio, n_videos)} entries."
+            )
+
+        for (i, row), vid in zip(pid_physio.iterrows(), dji_files):
+            mapped.append({**row.to_dict(), c.VIDEO_ID_COL: vid})
+
+    mapped_df = pd.DataFrame(mapped)
+
+    if not mapped_df.empty:
+        mapped_df[c.VIDEO_ID_COL] = (
+            mapped_df[c.VIDEO_ID_COL]
+            .astype(str)
+            .str.extract(r'video_(\d+)', expand=False)
+            .astype(int)
+        )
+
+    return mapped_df

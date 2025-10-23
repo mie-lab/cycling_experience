@@ -5,6 +5,7 @@ import utils.processing_utils
 from pathlib import Path
 import logging
 import constants as c
+from utils.physiological_data_utils import map_physiological_segments_to_videos
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ def main():
     lab_results_file = Path(config["filenames"]["lab_study_results_file"])
     lab_setup_file = Path(config['filenames']['lab_experiment_setup_file'])
     ground_truth_file = Path(config["filenames"]["video_info_ground_truth"])
+    physiological_data_file = Path(config["filenames"]["physiological_results_file"])
 
     # Define and create the output directory.
     output_dir = Path(config['paths']['output_dir'])
@@ -37,6 +39,7 @@ def main():
     video_ground_truth_features = pd.read_csv(ground_truth_file)
     experiment_setup = pd.read_csv(lab_setup_file, header=None).set_index(0, drop=True)
     lab_results_df = pd.read_excel(lab_results_file).set_index(c.PARTICIPANT_ID, drop=True)
+    physio_df = pd.read_csv(physiological_data_file)
 
     # Clean and preprocess the lab study data
     lab_results_df = utils.processing_utils.filter_aggregate_results(
@@ -44,10 +47,10 @@ def main():
         consent=False,
         duration=False,
         location=False,
-        gender=True,
-        cycling_environment=True,
-        cycling_frequency=True,
-        cycling_confidence=True
+        gender=False,
+        cycling_environment=False,
+        cycling_frequency=False,
+        cycling_confidence=False
     )
 
     demographics_df = lab_results_df[c.DEMOGRAPHIC_COLUMNS].copy()
@@ -73,16 +76,23 @@ def main():
     df1 = utils.helper_functions.trial_dict_to_df(video_rating_dict)
     df1 = utils.processing_utils.add_valence_arousal(df1, 'rating')
 
-    df1_with_features = df1.merge(
-        video_ground_truth_features,
-        on=c.VIDEO_ID_COL,
-        how='left'
-    )
-
-    final_df = df1_with_features.merge(
+    final_df = df1.merge(
         demographics_df,
         left_on=c.PARTICIPANT_ID,
         right_index=True,
+        how='left'
+    )
+
+    # Map segments to video files
+    mapped_physio_df = map_physiological_segments_to_videos(physio_df, experiment_setup, c.TRIAL_1, c.VIDEO_COUNTS)
+    final_df = final_df.merge(mapped_physio_df, on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL], how='left')
+
+    output_file = output_dir / "processed_lab_study_ratings.csv"
+    final_df.to_csv(output_file, index=False)
+
+    df1_with_features = final_df.merge(
+        video_ground_truth_features,
+        on=c.VIDEO_ID_COL,
         how='left'
     )
     print()
