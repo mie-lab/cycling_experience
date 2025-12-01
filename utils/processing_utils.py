@@ -65,7 +65,7 @@ def filter_aggregate_results(
         df: pd.DataFrame,
         consent: bool = True,
         duration: bool = True,
-        location: bool = True,
+        location: bool = False,
         gender: bool = False,
         age: bool = False,
         cycling_environment: bool = False,
@@ -611,10 +611,12 @@ def enrich_with_spatial_data(
     # Centralize all file path definitions from the config
     paths = {
         "manual_labels": Path(config["filenames"]["manual_labelling_file"]),
+        "negar_features": Path(config["filenames"]["negar_features_file"]),
         "bike_network": Path(config["filenames"]["bike_network_file"]),
         "traffic_volume": Path(config["filenames"]["traffic_volume_file"]),
         "road_network": Path(config["filenames"]["road_network_file"]),
         "side_parking": Path(config["filenames"]["side_parking_file"]),
+        "tree_canopy": Path(config["filenames"]["tree_canopy_file"]),
     }
 
     # Work on a copy to avoid modifying the original DataFrame
@@ -634,11 +636,16 @@ def enrich_with_spatial_data(
     enriched_geom = classify_cycleway_row(enriched_geom)
     enriched_geom = enriched_geom.drop(columns=bike_network_cols, errors='ignore')
 
-    # --- 3. MERGE OVERTAKES DATA ---
-    log.info("Enriching with overtake data...")
-    overtakes = pd.read_excel(paths["manual_labels"])
-    enriched_geom = enriched_geom.merge(overtakes, on=c.VIDEO_ID_COL, how='left').fillna({"motor_vehicle_overtakes_count": 0})
+    # --- 3.1 MERGE MANUAL DATA ---
+    log.info("Enriching with manually labelled data...")
+    manual_labels = pd.read_excel(paths["manual_labels"])
+    enriched_geom = enriched_geom.merge(manual_labels, on=c.VIDEO_ID_COL, how='left')
     enriched_geom["motor_vehicle_overtakes_presence"] = enriched_geom["motor_vehicle_overtakes_count"] > 0
+
+    # --- 3.2 MERGE NEGAR FEATURES ---
+    log.info("Enriching with Negar features data...")
+    negar_features = pd.read_csv(paths["negar_features"])
+    enriched_geom = enriched_geom.merge(negar_features, on=c.VIDEO_ID_COL, how='left')
 
     # --- 4. MERGE TRAFFIC VOLUME ---
     log.info("Enriching with traffic volume data...")
@@ -670,11 +677,17 @@ def enrich_with_spatial_data(
     enriched_geom['motorized_traffic_speed_kmh'] = enriched_geom['motorized_traffic_speed_kmh'].fillna(0).astype(int)
     enriched_geom['tram_lane_presence'] = enriched_geom['tram_lane_presence'].fillna(False).astype(bool)
 
-    # --- 6. MERGE SIDE PARKING PRESENCE ---
+    # --- 6. MERGE SIDE PARKING ---
     log.info("Enriching with side parking data...")
     side_parking = gpd.read_file(paths["side_parking"], layer='taz.view_pp_ogd')
     enriched_geom = merge_spatial_count(buffer_geom, enriched_geom, side_parking, 'side_parking_count', agg_func='size')
     enriched_geom['side_parking_presence'] = enriched_geom['side_parking_count'] > 0
+
+    # --- 7. MERGE GREENERY DATA ---
+    log.info("Enriching with greenery data...")
+    tree_canopy = gpd.read_file(paths["tree_canopy"]
+                             )
+    enriched_geom = merge_spatial_share(buffer_geom, enriched_geom, tree_canopy, 'tree_canopy_share', 'buff_area', percent=True)
 
     log.info("Spatial data enrichment process finished successfully.")
     return enriched_geom
