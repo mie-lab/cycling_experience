@@ -1,9 +1,7 @@
 import re
 import configparser
-import logging
 import matplotlib
 import warnings
-
 from utils.physiological_data_utils import *
 
 matplotlib.use('Agg')
@@ -12,8 +10,6 @@ matplotlib.use('Agg')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-# --- 6. Main ---
-
 
 def main():
     warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -21,9 +17,7 @@ def main():
     config.read("config.ini")
 
     root = Path(config['paths']['physiological_data_dir'])
-    out = Path(config['paths']['output_dir'])
     physiological_data_out = Path(config['filenames']['physiological_results_file'])
-    out.mkdir(exist_ok=True, parents=True)
 
     files = find_xdf_files(root)
     report_sampling_rates(files)
@@ -33,78 +27,157 @@ def main():
 
     for f in files:
         log.info(f"--- Processing {f.name} ---")
-        data = extract_physiological_data(f)
 
-        # Plot complete recording once
-        # plot_overall_signals(data, f, out)
+        # Parsing Participant ID
+        m = re.search(r'P(\d+)', f.stem)
+        participant_id = int(m.group(1)) if m else np.nan
 
-        # Preprocess and segment data
-        data, segments = preprocess_and_segment(data, SAMPLING_RATE)
+        try:
+            data = extract_physiological_data(f)
+            data, segments = preprocess_and_segment(data, SAMPLING_RATE)
+        except Exception as e:
+            log.error(f"Failed to process {f.name}: {e}")
+            continue
 
-        # --- Find calibration baseline ---
-        base_tonic, base_scr_amp = np.nan, np.nan
-        calibration_seg = next((s for s in segments if s['segment_type'] == 'calibration'), None)
+        # --------------------------------------------------------
+        # 1. Establish Baselines (Calibration)
+        # --------------------------------------------------------
+        # We store baseline values to compute "Deltas" (Reactivity)
+        baseline_values = {
+            'SCL': np.nan,
+            'RMSSD': np.nan,
+            'HR': np.nan,
+            'SDNN': np.nan,
+            'HF': np.nan
+        }
 
-        if calibration_seg:
-            cal_metrics = analyze_segment(
-                calibration_seg['EDA_Processed_Segment'],
-                calibration_seg['PPG_Processed_Segment'],
+        cal_seg = next((s for s in segments if s['segment_type'] == 'calibration'), None)
+
+        if cal_seg:
+            c_results = analyze_segment(
+                cal_seg['EDA_Processed_Segment'],
+                cal_seg['PPG_Processed_Segment'],
                 SAMPLING_RATE
             )
+            baseline_values['SCL'] = c_results.get('SCL_Mean', np.nan)
+            baseline_values['RMSSD'] = c_results.get('HRV_RMSSD', np.nan)
+            baseline_values['HR'] = c_results.get('PPG_Rate_Mean', np.nan)
+            baseline_values['SDNN'] = c_results.get('HRV_SDNN', np.nan)
+            baseline_values['HF'] = c_results.get('HRV_HF', np.nan)
 
-            base_tonic = cal_metrics.get('EDA_Tonic_Mean', np.nan)
-            base_scr_amp = cal_metrics.get('EDA_SCR_Amplitude_Mean', np.nan)
-            log.info(f" -> Calibration baseline: tonic={base_tonic:.3f}, SCR_amp={base_scr_amp:.3f}")
+            log.info(f" -> Baseline: SCL={baseline_values['SCL']:.2f}, HR={baseline_values['HR']:.1f}")
         else:
-            log.warning("No calibration segment found; skipping baseline normalization.")
+            log.warning("No calibration segment found; Deltas will be NaN.")
 
-        # --- Analyze video segments ---
-        for seg in [s for s in segments if s['segment_type'] == 'video']:
-            duration_s = seg['end_time'] - seg['start_time']
-            log.info(f" -> Segment {seg['segment_id']} ({duration_s:.1f}s)")
+        # --------------------------------------------------------
+        # 2. Process Video Segments
+        # --------------------------------------------------------
+        video_segments = [s for s in segments if s['segment_type'] == 'video']
 
-            seg_metrics = analyze_segment(
+        for seg in video_segments:
+            # A. Get All Raw Metrics (from your updated function)
+            m = analyze_segment(
                 seg['EDA_Processed_Segment'],
                 seg['PPG_Processed_Segment'],
                 SAMPLING_RATE
             )
 
-            # --- Combine metrics ---
-            m = re.search(r'P(\d+)', f.stem)
-            participant_id = int(m.group(1)) if m else np.nan
+            # B. Calculate Reactivity (Deltas)
+            # Formula: Segment_Value - Baseline_Value
 
-            seg_metrics.update({
+            # EDA Delta
+            m['SCL_Delta'] = m['SCL_Mean'] - baseline_values['SCL']
+
+            # Cardiac Deltas
+            m['HR_Delta'] = m['PPG_Rate_Mean'] - baseline_values['HR']
+            m['HRV_RMSSD_Delta'] = m['HRV_RMSSD'] - baseline_values['RMSSD']
+            m['HRV_SDNN_Delta'] = m['HRV_SDNN'] - baseline_values['SDNN']
+            m['HRV_HF_Delta'] = m['HRV_HF'] - baseline_values['HF']
+
+            # C. Add Metadata
+            m.update({
                 'participant_id': participant_id,
                 'segment_id': seg['segment_id'],
-                'EDA_Tonic_Normalized': (
-                    seg_metrics['EDA_Tonic_Mean'] - base_tonic
-                    if pd.notna(base_tonic) else np.nan
-                ),
-                'EDA_SCR_Amplitude_Normalized': (
-                    seg_metrics['EDA_SCR_Amplitude_Mean'] - base_scr_amp
-                    if pd.notna(base_scr_amp) else np.nan
-                ),
+                'duration': seg['end_time'] - seg['start_time'],
             })
-            # plot_segment_signals(seg['EDA_Processed_Segment'], seg['PPG_Processed_Segment'], f, seg['segment_id'], out)
-            all_metrics.append(seg_metrics)
 
-    # --- Save results ---
+            all_metrics.append(m)
+
+    # --- Save Results ---
     if all_metrics:
         df = pd.DataFrame(all_metrics)
-        cols = [
-            'participant_id', 'segment_id', 'duration_s',
-            'Heart_Rate_Mean', 'HRV_RMSSD', 'HRV_SD1',
-            'EDA_SCR_Count', 'EDA_SCR_Amplitude_Mean', 'EDA_Tonic_Mean',
-            'EDA_Tonic_Normalized', 'EDA_SCR_Amplitude_Normalized'
-        ]
-        df = df[[c for c in cols if c in df.columns]]
-        save_path = physiological_data_out
-        df.to_csv(save_path, index=False)
-        log.info(f"Metrics saved to: {save_path}")
-        # plot_eda_normalization(df, out)
-    else:
-        log.warning("No metrics extracted. Nothing to save.")
 
+        # Definition of ALL columns to save (Order matters for readability)
+        cols = [
+            'participant_id', 'segment_id', 'duration',
+
+            # --- 1. EDA Phasic (Event-Related) ---
+            'SCR_Peaks_N',
+            'SCR_Peaks_Amplitude_Mean',
+            'SCR_Peaks_Amplitude_SD',
+            'SCR_Peaks_Amplitude_Max',
+            'SCR_Mean',
+            'SCR_SD',
+            'SCR_AUC',
+            'SCR_Recovery_Slope',
+
+            # --- 2. EDA Tonic (Background Levels) ---
+            'SCL_Mean',
+            'SCL_Delta',  # Calculated in main
+            'SCL_SD',
+            'SCL_Max',
+            'SCL_Min',
+            'SCL_Slope',
+
+            # --- 3. EDA Sliding Window ---
+            'SCL_window_mean',
+            'SCL_window_sd',
+            'SCL_window_slope_mean',
+            'SCL_window_slope_max',
+            'SCL_window_slope_min',
+
+            # --- 4. PPG Heart Rate ---
+            'PPG_Rate_Mean',
+            'HR_Delta',  # Calculated in main
+            'PPG_Rate_SD',
+            'HR_Min',
+            'HR_Max',
+
+            # --- 5. HRV Time Domain ---
+            'HRV_RMSSD',
+            'HRV_RMSSD_Delta',  # Calculated in main
+            'HRV_SDNN',
+            'HRV_SDNN_Delta',  # Calculated in main
+            'HRV_MeanNN',
+            'HRV_pNN20',
+            'HRV_pNN50',
+            'HRV_SD1',
+
+            # --- 6. HRV Frequency Domain ---
+            'HRV_LF',
+            'HRV_HF',
+            'HRV_HF_Delta',  # Calculated in main
+            'HRV_LFHF',
+        ]
+
+        # Filter to ensure we don't crash if a column is missing
+        # (Calculates the intersection of desired cols and existing cols)
+        final_cols = [c for c in cols if c in df.columns]
+
+        # Check if any new metrics were missed
+        missing = set(df.columns) - set(final_cols)
+        if missing:
+            log.info(f"Note: The following extra columns were generated but not explicitly ordered: {missing}")
+            # Optionally append them to the end:
+            # final_cols.extend(list(missing))
+
+        df = df[final_cols]
+        df.to_csv(physiological_data_out, index=False)
+        log.info(f"All metrics saved to: {physiological_data_out}")
+    else:
+        log.warning(" No metrics extracted.")
 
 if __name__ == "__main__":
+    # Ensure the save_segment_data_csv function is defined outside of main()
+    # and that all imports (Path, numpy, pandas) are present at the top of your script.
     main()
