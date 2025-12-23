@@ -617,6 +617,7 @@ def enrich_with_spatial_data(
         "road_network": Path(config["filenames"]["road_network_file"]),
         "side_parking": Path(config["filenames"]["side_parking_file"]),
         "tree_canopy": Path(config["filenames"]["tree_canopy_file"]),
+        "greenery_share_gis": Path(config["filenames"]["greenery_file"]),
     }
 
     # Work on a copy to avoid modifying the original DataFrame
@@ -685,9 +686,12 @@ def enrich_with_spatial_data(
 
     # --- 7. MERGE GREENERY DATA ---
     log.info("Enriching with greenery data...")
-    tree_canopy = gpd.read_file(paths["tree_canopy"]
-                             )
+    tree_canopy = gpd.read_file(paths["tree_canopy"])
     enriched_geom = merge_spatial_share(buffer_geom, enriched_geom, tree_canopy, 'tree_canopy_share', 'buff_area', percent=True)
+
+    greenery = gpd.read_file(paths["greenery_share_gis"])
+    enriched_geom = merge_spatial_share(buffer_geom, enriched_geom, greenery, 'greenery_share_gis', 'buff_area',
+                                        percent=True)
 
     log.info("Spatial data enrichment process finished successfully.")
     return enriched_geom
