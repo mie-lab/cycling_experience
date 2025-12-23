@@ -1,5 +1,5 @@
 pandas~=2.3.3
-scipy==1.16.2
+scipy==1.16.3
 numpy==2.2.3
 transformers==4.56.1
 pillow==11.1.0
@@ -15,3 +15,4 @@ google-genai==1.41.0
 pydantic==2.11.10
 neurokit2~=0.2.10
 pyxdf~=1.17.1
+pingouin~=0.5.5
