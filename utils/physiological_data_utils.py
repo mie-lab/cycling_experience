@@ -52,12 +52,16 @@ def _create_segment_data(
     """Helper: slice data for one segment."""
     s_idx = np.searchsorted(shimmer_ts, start_time, side='left')
     e_idx = np.searchsorted(shimmer_ts, end_time, side='right')
+    padding_sec = 4.0
+    effective_end = end_time + padding_sec if segment_type == 'video' else end_time
+    e_idx = np.searchsorted(shimmer_ts, effective_end, side='right')
+
     if s_idx >= e_idx:
         return None
     return {
         'segment_id': segment_id, 'segment_type': segment_type,
         'start_event': start_event, 'end_event': end_event,
-        'start_time': start_time, 'end_time': end_time,
+        'start_time': start_time, 'end_time': effective_end,
         'EDA_timestamps': shimmer_ts[s_idx:e_idx],
         'EDA_series': raw_eda[s_idx:e_idx],
         'EDA_Processed_Segment': eda_df.iloc[s_idx:e_idx],
