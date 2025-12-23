@@ -24,6 +24,7 @@ class VideoFeatures(BaseModel):
     bike_lane_width_estimate_meters: float
     side_parking_presence: bool
     tram_lane_presence: bool
+    bus_lane_presence: bool
     unique_motor_vehicles_count: int
     motorized_traffic_speed_kmh: float
     car_overtakes_count: int
@@ -31,6 +32,9 @@ class VideoFeatures(BaseModel):
     unique_cyclists_count: int
     unique_pedestrians_count: int
     average_greenery_share: float
+    average_building_share: float
+    average_sky_share: float
+    average_road_share: float
 
 
 def get_llm_extracted_features(config: configparser.ConfigParser) -> dict:
@@ -93,8 +97,34 @@ def get_llm_extracted_features(config: configparser.ConfigParser) -> dict:
             time.sleep(1)
 
     # TODO replace with a csv export
-    with open(Path(config["filenames"]["video_info_llm_extraction"]), "w") as f:
-        json.dump(all_features, f, indent=2)
+    #with open(Path(config["filenames"]["video_info_llm_extraction"]), "w") as f:
+    #    json.dump(all_features, f, indent=2)
+
+    # --- CSV EXPORT LOGIC ---
+    if not all_features:
+        log.warning("No features extracted. Skipping CSV export.")
+        return {}
+
+    log.info("Converting extracted features to DataFrame...")
+
+    # 1. Create DataFrame (orient='index' uses filenames as rows)
+    df_llm = pd.DataFrame.from_dict(all_features, orient='index')
+    df_llm = df_llm.reset_index().rename(columns={'index': 'source_filename'})
+
+    try:
+        df_llm['video_name'] = df_llm['source_filename'].str.extract(r'(video_\d+)')
+        cols = ['video_name', 'source_filename'] + [c for c in df_llm.columns if
+                                                    c not in ['video_name', 'source_filename']]
+        df_llm = df_llm[cols]
+    except Exception as e:
+        log.warning(f"Could not extract clean video_name (e.g., 'video_54') from filenames: {e}")
+
+    output_path = Path(config["filenames"]["video_info_llm_extraction"]).with_suffix(".csv")
+
+    df_llm.to_csv(output_path, index=False)
+    log.info(f"Successfully exported LLM features to CSV at: {output_path}")
+
+    return all_features
 
 
 def run_ground_truth_comparison(config: configparser.ConfigParser) -> None:
