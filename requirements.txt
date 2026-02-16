@@ -16,3 +16,6 @@ pydantic==2.11.10
 neurokit2~=0.2.10
 pyxdf~=1.17.1
 pingouin~=0.5.5
+diptest~=0.10.0
+lingam~=1.11.0
+semopy~=2.3.11

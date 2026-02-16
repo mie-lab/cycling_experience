@@ -3,12 +3,10 @@ import utils.helper_functions
 import utils.plotting_utils
 import utils.processing_utils
 import utils.lmm_utils
-import pandas as pd
-from scipy.stats import spearmanr
 import configparser
 import logging
-from itertools import product
 from pathlib import Path
+import pandas as pd
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -35,203 +33,235 @@ def main():
     # PHASE 1: LOAD & PREPROCESS DATA
     # ==============================================================================
     log.info("Loading and preprocessing data...")
+
     survey_df = pd.read_excel(survey_results_file).set_index(c.PARTICIPANT_ID)
     seq_df = pd.read_csv(sequence_file, parse_dates=['seq_start', 'seq_end'])
 
-    # Transform survey responses into a long format
-    survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
-
     # Clean and preprocess the survey response data
-    survey_results_df = utils.processing_utils.filter_aggregate_results(survey_results_df,
-                                                                        age=True,
-                                                                        gender=True,
-                                                                        cycling_environment=True,
-                                                                        cycling_frequency=True,
-                                                                        cycling_confidence=True)
+    survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
+    survey_results_df = utils.processing_utils.filter_results(survey_results_df)
     survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
-    survey_results_df = utils.processing_utils.assign_affective_states(survey_results_df)
 
-    # Aggregate to video-level valence and arousal scores
-    video_level_scores = utils.processing_utils.aggregate_video_level_scores(survey_results_df)
-    utils.plotting_utils.plot_affect_grid(survey_results_df, save_path=output_dir)
+    # =============================================================================
+    # PHASE 2: DEMOGRAPHIC SUMMARY AND AGGREGATION
+    # =============================================================================
+    log.info("Generating demographic summaries and aggregating categories...")
 
-    # ==============================================================================
-    # PHASE 2: DESCRIBE FINAL SAMPLE
-    # ==============================================================================
-    log.info("\n--- Final Sample Demographics ---")
-
-    demographic_summary_table = utils.plotting_utils.generate_demographic_summary(
-        df=survey_results_df,
-        columns=c.DEMOGRAPHIC_COLUMNS,
-        orders=c.CATEGORY_ORDERS,
-        save_path=output_dir / 'demographic_overview.png'
-    )
-    log.info(demographic_summary_table)
-
-    # ==============================================================================
-    # PHASE 3: RUN STATISTICAL ANALYSES
-    # ==============================================================================
-    log.info("\n--- Running Statistical Analyses ---")
-
-    # Center categorical predictors for easier interpretation of model intercepts
-    survey_results_df = utils.processing_utils.add_midpoint_centered_column(survey_results_df, 'OE', c.OE_ORDER)
-    survey_results_df = utils.processing_utils.add_midpoint_centered_column(survey_results_df, 'F', c.FAM_ORDER)
-
-    # --- Correlation Tests ---
-    spearman_corr, spearman_p = spearmanr(survey_results_df[c.VALENCE], survey_results_df['OE_centered'])
-    log.info(f"Spearman corr (Valence vs OE): rho = {spearman_corr: .3f}, p = {spearman_p: .3g}")
-
-    spearman_corr, spearman_p = spearmanr(survey_results_df[c.AROUSAL], survey_results_df['OE_centered'])
-    log.info(f"Spearman corr (Arousal vs OE): rho = {spearman_corr: .3f}, p = {spearman_p: .3g}")
-
-    # ==============================================================================
-    # PHASE 4: LMMs ANALYSES - TESTING VALENCE AND AROUSAL
-    # ==============================================================================
-    log.info("\n--- LMM Analysis: Predicting Overall Experience (OE) ---")
-
-    # --- Step 1: Fit a sequence of nested models ---
-
-    log.info("\n--- Fitting Baseline Model (Intercept-Only) ---")
-    model_baseline = utils.lmm_utils.run_lmm(
+    # Aggregate demographic categories to ensure sufficient sample size in each group
+    survey_results_df = utils.processing_utils.aggregate_by_characteristics(
         survey_results_df,
-        formula="OE_centered ~ 1",
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
+        age=True,
+        gender=True,
+        cycling_frequency=True,
+        cycling_confidence=True,
+        cycling_purpose=True,
+        cycling_environment=True,
+        familiarity=True,
+        is_swiss=True
     )
 
-    log.info("\n--- Fitting Model with Valence ---")
-    model_valence = utils.lmm_utils.run_lmm(
-        survey_results_df,
-        formula="OE_centered ~ valence",
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
+    # Generate demographic summary table with aggregated categories
+    utils.plotting_utils.generate_demographic_table(
+       survey_results_df,
+       demo_cols=c.DEMOGRAPHIC_COLUMNS,
+       output_path=Path(output_dir / 'demographic_summary_aggregated.csv')
     )
 
-    log.info("\n--- Fitting Model with Arousal ---")
-    model_arousal = utils.lmm_utils.run_lmm(
-        survey_results_df,
-        formula="OE_centered ~ arousal",
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    #reliability_df = utils.processing_utils.compute_video_reliability(survey_results_df)
+    #log.info(f"\n--- Video Reliability (ICC) ---\n{reliability_df}\n")
 
-    log.info("\n--- Fitting Additive Model (Valence + Arousal) ---")
-    model_additive = utils.lmm_utils.run_lmm(
-        survey_results_df,
-        formula="OE_centered ~ valence + arousal",
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    # =============================================================================
+    # PHASE 3: EXPLORATORY ANALYSIS & VISUALIZATION (RQ1)
+    # =============================================================================
+    log.info("Generating exploratory visualizations for RQ1...")
 
-    log.info("\n--- Fitting Interactive Model (Valence * Arousal) ---")
-    model_interactive = utils.lmm_utils.run_lmm(
-        survey_results_df,
-        formula="OE_centered ~ valence * arousal",
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    # Plot affect grid for all videos combined
+    #utils.plotting_utils.plot_affect_grid_subplots(
+    #   survey_results_df,
+    #   ncols=5, nrows=6,
+    #   normalize="count",
+    #   robust_vmax_percentile=99,
+    #   save_path=output_dir / "affect_grid_all_videos.png",
+    #)
 
-    # --- Step 2: Perform Likelihood Ratio Tests to compare the models ---
-    log.info("\n--- Performing Sequential Model Comparisons ---")
+    # Plot separate heatmaps for each video
+    #utils.plotting_utils.plot_affect_grid(
+    #   survey_results_df,
+    #   video_id=None,
+    #   save_path=output_dir / "affect_grid_heatmaps")
 
-    log.info("\n--- Comparison 1: Is Valence a significant predictor? ---")
-    utils.lmm_utils.lr_test_mixed(model_baseline, model_valence)
+    # Plot affect grid usage with marginals (overall)
+    #utils.plotting_utils.plot_affect_grid_usage_with_marginals(
+    #   survey_results_df,
+    #   normalize="count",
+    #   save_path=output_dir / "affect_grid_usage.png",
+    #)
 
-    log.info("\n--- Comparison 2: Is Arousal a significant predictor? ---")
-    utils.lmm_utils.lr_test_mixed(model_baseline, model_arousal)
-
-    log.info("\n--- Comparison 3: Does adding Arousal improve a model that already has Valence? ---")
-    utils.lmm_utils.lr_test_mixed(model_valence, model_additive)
-
-    log.info("\n--- Comparison 4: Does the interaction of Valence and Arousal significantly improve the model? ---")
-    utils.lmm_utils.lr_test_mixed(model_additive, model_interactive)
+    # Plot affective quadrant distribution for each video
+    #utils.plotting_utils.create_quadrant_distribution_plot(
+    #   survey_results_df,
+    #   video_id_column=c.VIDEO_ID_COL,
+    #   output_path=output_dir / "affective_quadrant_distribution_per_video.png"
+    #)
 
     # ==============================================================================
+    # PHASE 4: VIDEO-LEVEL AFFECT METRICS & PF/NF DISAGREEMENT ANALYSIS (RQ2)
+    # ==============================================================================
+    log.info("Calculating video-level affect metrics and analyzing PF/NF disagreement for RQ2...")
 
-    # --- LMM Analysis: Testing the effect of Familiarity (F_centered) on different outcomes ---
+    # Calculate video-level affect metrics and save to CSV
+    video_level_scores = utils.processing_utils.calculate_video_level_scores(
+        survey_results_df,
+        output_path=Path(output_dir / "video_level_affect_metrics.csv")
+    )
 
-    formulas = ["valence ~ F_centered",
-                'arousal ~ F_centered',
-                'OE_centered ~ F_centered'
-                ]
+    # Plot video-level affect means with vectors for OE groups
+    #utils.plotting_utils.plot_video_affect_means_with_vectors(
+    #   video_level_scores,
+    #   save_path=output_dir / "video_affect_vectors_oe.png",
+    #   oe_col="oe_mode",
+    #)
 
-    for formula in formulas:
-        dependent_var = formula.split(' ')[0]
-        log.info(f"\n--- Analyzing Effect of Familiarity on: {dependent_var.upper()} ---")
+    # Add PF/NF label counts to video-level scores and save to CSV
+    video_level_scores = utils.processing_utils.add_factor_counts_to_scores(
+        video_level_scores,
+        survey_results_df,
+        c.LABEL_COLS,
+        video_col=c.VIDEO_ID_COL,
+        pf_col=c.PF,
+        nf_col=c.NF
+    )
 
-        # --- Step 1: Fit the Baseline Model for this outcome ---
-        log.info(f"--- Fitting Baseline Model: {dependent_var} ~ 1 ---")
-        model_baseline = utils.lmm_utils.run_lmm(
+    video_level_scores, _ = utils.processing_utils.pf_nf_disagreement_analysis(
+        video_level_scores,
+        label_cols=c.LABEL_COLS,
+        out_csv_path=output_dir / "video_level_affect_metrics_pf_nf.csv"
+    )
+
+    # ==============================================================================
+    # PHASE 4.5: MARGINAL AFFECTIVE DRIVER ANALYSIS (LOCAL DISPLACEMENT)
+    # ==============================================================================
+    log.info("Phase 4.5: Calculating marginal affective pull of environmental drivers...")
+
+    # 1. Identify drivers through local displacement calculation
+    affective_drivers = utils.processing_utils.get_marginal_affective_drivers(
+        survey_results_df,
+        c.LABEL_COLS
+    )
+
+    # 2. Plot the affective force field
+    utils.plotting_utils.plot_conditional_displacement_vectors(
+        affective_drivers,
+        output_dir / "environmental_affective_drivers_force_field.png",
+        limit=0.35
+    )
+
+    # =============================================================================
+    # PHASE 5: SUBGROUP ANALYSIS & VISUALIZATION (RQ3)
+    # =============================================================================
+    log.info("Calculating subgroup video-level scores and generating visualizations for RQ3...")
+
+    # Calculate video-level scores by demographic subgroups and save to separate CSVs
+    for col in c.DEMOGRAPHIC_COLUMNS:
+        utils.processing_utils.calculate_video_level_scores_by_subgroup(
             survey_results_df,
-            formula=f"{dependent_var} ~ 1",
-            groups_col=c.PARTICIPANT_ID,
-            convergence_method='cg'
+            subgroup_col=col,
+            min_participants=20,
+            output_path=output_dir / f"video_metrics_by_{col}.csv"
         )
 
-        # --- Step 2: Fit the Full Model with the predictor ---
-        log.info(f"--- Fitting Full Model: {formula} ---")
-        model_full = utils.lmm_utils.run_lmm(
-            survey_results_df,
-            formula=formula,
-            groups_col=c.PARTICIPANT_ID,
-            convergence_method='cg'
-        )
+    files = {
+        "Frequency": output_dir / "video_metrics_by_Cycling_frequency.csv",
+        "Confidence": output_dir / "video_metrics_by_Cycling_confidence.csv",
+        "Purpose": output_dir / "video_metrics_by_Cycling_purpose.csv",
+        "Environment": output_dir / "video_metrics_by_Cycling_environment.csv",
+        "Gender": output_dir / "video_metrics_by_Gender.csv",
+        "Age": output_dir / "video_metrics_by_Age.csv",
+        "Familiarity": output_dir / "video_metrics_by_is_swiss.csv",
+    }
 
-        # --- Step 3: Perform Likelihood Ratio Test ---
-        log.info(f"--- Comparison: Is F_centered a significant predictor for {dependent_var}? ---")
-        utils.lmm_utils.lr_test_mixed(model_baseline, model_full)
-        log.info("-" * 70)
+    subgroup_cols = {
+        "Frequency": "Cycling_frequency",
+        "Confidence": "Cycling_confidence",
+        "Purpose": "Cycling_purpose",
+        "Environment": "Cycling_environment",
+        "Gender": "Gender",
+        "Age": "Age",
+        "Familiarity": "is_swiss",
+    }
 
-    # ==============================================================================
-    formulas = ['is_Tension ~ F_centered',
-                'is_Activation ~ F_centered',
-                'is_Contentment ~ F_centered',
-                'is_Deactivation ~ F_centered'
-                ]
-    for formula in formulas:
-        log.info(f"\n--- Running Bayesian Logistic LMM: {formula} ---")
-        utils.lmm_utils.run_bayes_logistic_lmm(
-            df=survey_results_df,
-            formula=formula,
-            groups_col=c.PARTICIPANT_ID
-        )
+    metrics = [
+        "dispersion_mean_distance",
+        "anisotropy_index",
+        "affect_state_entropy",
+        "polarization_index",
+    ]
 
-    log.info("\n--- Testing for Demographic Groups---")
-    for dv, group_col in product(c.DEPENDENT_VARIABLES, c.DEMOGRAPHIC_COLUMNS):
-        # remove groups with < 5 participants
-        analysis_df = utils.processing_utils.filter_by_group_size(survey_results_df, group_col, c.PARTICIPANT_ID, 5)
-        analysis_df[group_col] = analysis_df[group_col].astype('category')
+    metric_labels = {
+        "dispersion_mean_distance": "Dispersion",
+        "anisotropy_index": "Anisotropy",
+        "affect_state_entropy": "Quadrant entropy",
+        "polarization_index": "Polarization",
+    }
 
-        log.info(f"\n--- Analyzing Differences in '{dv.title()}' by '{group_col.replace('_', ' ').title()}' ---")
-        log.info(f"Intercept (Reference Group): {analysis_df[group_col].cat.categories[0]}")
-
-        utils.lmm_utils.run_lmm(
-            analysis_df,
-            formula=f"{dv} ~ C({group_col})",
-            groups_col=c.PARTICIPANT_ID,
-            convergence_method='cg'
-        )
-
-    # ==============================================================================
-    # PHASE 4: GENERATE VISUALIZATIONS
-    # ==============================================================================
-    log.info("\n--- Generating and Saving Visualizations ---")
-    # Generate and save all standard plots for the analysis
-    utils.plotting_utils.plot_oe_distribution_by_fam(
-        survey_results_df,
-        c.FAM_ORDER,
-        c.OE_ORDER,
-        save_path=output_dir / 'oe_dist_by_familiarity.png'
+    # Plot subgroup metrics with bootstrap confidence intervals and save the figure
+    utils.plotting_utils.plot_subgroup_metrics_bootstrap(
+        files=files,
+        subgroup_cols=subgroup_cols,
+        metrics=metrics,
+        metric_labels=metric_labels,
+        overall_path=output_dir / "video_level_affect_metrics_pf_nf.csv",
+        n_boot=1000,
+        seed=42,
+        min_videos=5,
+        figsize=(14, 7.5),
+        save_path=output_dir / "subgroups_overlay_metrics.png",
     )
 
-    utils.plotting_utils.plot_overall_experience(
-        survey_results_df,
-        c.OE,
-        c.OE_ORDER,
-        save_path=output_dir / 'overall_experience_by_video.png'
+    # ==============================================================================
+    # DIAGNOSTIC ANALYSIS: CORRELATIONS BETWEEN CLIP-LEVEL METRICS
+    # ==============================================================================
+
+    metric_cols = [
+        "valence_mean",
+        "arousal_mean",
+        "oe_mean",
+        "oe_mode",
+        "dispersion_mean_distance",
+        "anisotropy_index",
+        "polarization_index",
+        "affect_state_entropy",
+        "pf_nf_label_entropy"
+    ]
+
+    utils.plotting_utils.plot_metric_correlations(
+        df=video_level_scores,
+        cols_to_plot=metric_cols,
+        output_dir=output_dir / "diagnostic_analysis.png"
     )
 
-    log.info("\nAnalysis pipeline finished successfully.")
+    # Plot valence and arousal distributions by observer experience (OE)
+    utils.plotting_utils.plot_valence_arousal_by_oe(
+        survey_results_df,
+        oe_col=c.OE,
+        oe_order=c.OE_ORDER,
+        valence_col=c.VALENCE,
+        arousal_col=c.AROUSAL,
+        kind="box",
+        save_path=output_dir / "valence_arousal_by_oe.png",
+    )
+
+    # Plot disagreement geometry vs. PF/NF label entropy and save the figure
+    utils.plotting_utils.plot_disagreement_geometry_vs_cues(
+        video_level_scores,
+        save_path=output_dir / "metrics_vs_cues_valence.png",
+        video_col=c.VIDEO_ID_COL,
+        experience_col='valence_mean',
+        cue_col="pf_nf_label_entropy"
+    )
+
+    # ==============================================================================
+    log.info('Analysis complete.')
 
 
 if __name__ == "__main__":

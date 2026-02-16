@@ -23,6 +23,7 @@ CYCL_FREQ = 'Cycling_frequency'
 CYCL_CONF = 'Cycling_confidence'
 CYCL_PURP = 'Cycling_purpose'
 CYCL_ENV = 'Cycling_environment'
+AFFECT_STATE = 'affective_state'
 
 # Levels and their orderings
 GENDER_ORDER = [
@@ -84,14 +85,15 @@ OE_ORDER = [
     'Very positive'
     ]
 
-AFFECTIVE_STATES = ['Tension', 'Activation', 'Contentment', 'Deactivation']
+AFFECTIVE_STATES = ["Excitement", "Relaxation", "Stress", "Boredom"]
 
 DEPENDENT_VARIABLES = (VALENCE, AROUSAL)
 
 # We focus on valence as the primary target variable
 TARGET_COL = VALENCE
 
-DEMOGRAPHIC_COLUMNS = [GENDER, AGE, CYCL_FREQ, CYCL_PURP, CYCL_CONF, CYCL_ENV]
+IS_SWISS = 'is_swiss'
+DEMOGRAPHIC_COLUMNS = [GENDER, AGE, CYCL_FREQ, CYCL_PURP, CYCL_CONF, CYCL_ENV, IS_SWISS]
 
 CATEGORY_ORDERS = {
     GENDER: GENDER_ORDER,

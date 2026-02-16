@@ -1,15 +1,23 @@
 import os
-from pathlib import Path
-from typing import Any
-import re
-import ast
-import numpy as np
 from shapely import LineString
-import pandas as pd
 import geopandas as gpd
-from typing import List, Union
-import constants as c
 import logging
+from sklearn.mixture import BayesianGaussianMixture, GaussianMixture
+from scipy.stats import spearmanr
+from scipy.spatial.distance import pdist
+from sklearn.decomposition import PCA
+import re
+from typing import Sequence
+from scipy.spatial.distance import cdist
+import matplotlib
+from pathlib import Path
+from typing import Optional, Union, List, Dict, Any
+import numpy as np
+import constants as c
+import ast
+import pandas as pd
+import statsmodels.formula.api as smf
+matplotlib.use("TkAgg")
 
 
 # --- Functions for Candidate Video Selection ---
@@ -61,30 +69,20 @@ def transform_to_long_df(
     return pd.DataFrame(rows, columns=[id_col] + demo_cols + [c.VIDEO_ID_COL] + questions)
 
 
-def filter_aggregate_results(
+def filter_results(
         df: pd.DataFrame,
         consent: bool = True,
         duration: bool = True,
-        location: bool = False,
-        gender: bool = False,
-        age: bool = False,
-        cycling_environment: bool = False,
-        cycling_frequency: bool = False,
-        cycling_confidence: bool = False,
+        location: bool = True,
         by_country: bool = False
 ) -> pd.DataFrame:
     """
-    Implements filtering and aggregation logic to clean the survey response data
-    :param consent: bool = True, filter out entries without consent.
-    :param duration: bool = True, filter out entries with duration less than 15 minutes.
-    :param location: bool = True, filter out entries with missing location data.
-    :param by_country: bool = False, if True, apply location filter by country.
-    :param age: bool = True, aggregate age groups 46-55, 56-65, +65 into '46+ years'.
-    :param gender: bool = True, only keep 'Male' and 'Female' entries.
-    :param cycling_frequency: bool = False, aggregate into 'Infrequent', 'Occasional', 'Regular'.
-    :param cycling_environment: bool = False, filter out 'Other' responses.
-    :param cycling_confidence: bool = False, aggregate into 'Confident' and 'Not confident'.
+    Implements filtering logic to clean the survey response data
     :param df: DataFrame containing the data to filter.
+    :param consent: bool = True, filter out participants without consent.
+    :param duration: bool = True, filter out participants with duration less than 15 minutes.
+    :param location: bool = True, filter out participants with missing location data.
+    :param by_country: bool = False, if True, apply location filter by country.
     :return: Filtered DataFrame.
     """
     df = df.copy()
@@ -100,12 +98,43 @@ def filter_aggregate_results(
     if duration:
         start = pd.to_datetime(df[c.START], format='%m/%d/%y %H:%M:%S', errors='coerce')
         end = pd.to_datetime(df[c.END], format='%m/%d/%y %H:%M:%S', errors='coerce')
-        mask &= (end - start) >= pd.Timedelta(minutes=15)
+        mask &= (end - start) >= pd.Timedelta(minutes=15) # video duration without breaks for scoring
 
     if location:
         mask &= df[c.COUNTRY] != '_'
-        if by_country:
-            mask &= df[c.COUNTRY].isin(['Switzerland', 'CH'])
+
+    if by_country:
+        mask &= df[c.COUNTRY].isin(['Switzerland', 'CH'])
+
+    return df.loc[mask]
+
+
+def aggregate_by_characteristics(
+        df: pd.DataFrame,
+        gender: bool = False,
+        age: bool = False,
+        cycling_environment: bool = False,
+        cycling_frequency: bool = False,
+        cycling_confidence: bool = False,
+        cycling_purpose: bool = False,
+        familiarity: bool = False,
+        is_swiss: bool = False
+):
+    """
+    Implements aggregation logic to group categories for demographic and cycling-related characteristics.
+    :param is_swiss: if True, create a new binary column 'is_swiss' based on the 'Country' column.
+    :param df: DataFrame containing the data to filter.
+    :param gender: if True, remove 'Prefer not to say' category.
+    :param age: if True, upward aggregate age groups from '46 - 55 years', '56 - 65 years', '+65 years' to '46+ years'.
+    :param cycling_environment: if True, remove 'Other' category.
+    :param cycling_frequency: if True, aggregate cycling frequency categories into 'Frequent' and 'Infrequent'.
+    :param cycling_confidence: if True, aggregate cycling confidence into 'Confident' and 'Not confident'.
+    :param cycling_purpose: if True, aggregate cycling purpose categories into 'Commuting' and 'Recreational', 'I do not cycle'.
+    :param familiarity: if True, aggregate familiarity categories into 'Unfamiliar', 'Neutral', and 'Familiar'.
+    :return: aggregated DataFrame.
+    """
+    df = df.copy()
+    mask = pd.Series(True, index=df.index)
 
     # if upward aggregation needed to gain some significance power
     if age:
@@ -125,15 +154,14 @@ def filter_aggregate_results(
 
     if cycling_frequency:
         mask &= df[c.CYCL_FREQ] != 'Other'
-
         frequency_lookup = {
             "Never": "Infrequent",
             "Less than once a month": "Infrequent",
-            "1-3 times/month": "Occasional",
-            "1-2 days/week": "Occasional",
-            "3-4 days/week": "Regular",
-            "5-6 days/week": "Regular",
-            "Every day": "Regular"
+            "1-3 times/month": "Infrequent",
+            "1-2 days/week": "Frequent",
+            "3-4 days/week": "Frequent",
+            "5-6 days/week": "Frequent",
+            "Every day": "Frequent"
         }
 
         df[c.CYCL_FREQ] = df[c.CYCL_FREQ].replace(frequency_lookup)
@@ -147,7 +175,98 @@ def filter_aggregate_results(
         }
         df[c.CYCL_CONF] = df[c.CYCL_CONF].replace(frequency_lookup)
 
-    return df.loc[mask]
+    if cycling_purpose:
+        purpose_lookup = {
+            'Commuting (e.g., work, school)': 'Commuting',
+            'All purposes': 'Commuting',
+            'Recreational / leisure': 'Recreational',
+            'Exercise / fitness': 'Recreational',
+            'Other': 'Recreational'
+        }
+        df[c.CYCL_PURP] = df[c.CYCL_PURP].replace(purpose_lookup)
+
+    if familiarity:
+        familiarity_lookup = {
+            'Not at all familiar': 'Unfamiliar',
+            'Somewhat unfamiliar': 'Unfamiliar',
+            'Equally familiar and unfamiliar': 'Neutral',
+            'Somewhat familiar': 'Familiar',
+            'Extremely familiar': 'Familiar'
+        }
+        df[c.F] = df[c.F].replace(familiarity_lookup)
+
+    df = df.loc[mask]
+
+    if is_swiss:
+        # Define Switzerland binary (handles potential 'CH' or 'Switzerland' strings)
+        swiss_labels = ['Switzerland', 'CH']
+        df[c.IS_SWISS] = df[c.COUNTRY].apply(
+            lambda x: 'Swiss Resident' if x in swiss_labels else 'Not Swiss Resident'
+        )
+
+    return df
+
+
+def get_marginal_affective_drivers(long_df, label_cols):
+    """
+    Isolates the 'Marginal Pull' of environmental factors.
+    Calculates the displacement vector between the tag-selecting subgroup and the specific video consensus.
+    """
+    # Video consensus serves as the 'zero-point' for each scenario
+    video_consensus = long_df.groupby(c.VIDEO_ID_COL)[[c.VALENCE, c.AROUSAL]].mean()
+
+    driver_data = []
+    for tag in label_cols:
+        is_pf = tag.startswith('PF:')
+        source_col = c.PF if is_pf else c.NF
+        label_name = tag.split(': ')[1]
+
+        # Parse semicolon-separated labels to identify the subgroup
+        def match_label(val):
+            return label_name in [s.strip() for s in str(val).split(';')] if pd.notna(val) else False
+
+        subgroup_df = long_df[long_df[source_col].apply(match_label)]
+
+        if not subgroup_df.empty:
+            # Mean of participants who perceived this specific factor
+            subgroup_means = subgroup_df.groupby(c.VIDEO_ID_COL)[[c.VALENCE, c.AROUSAL]].mean()
+            counts = subgroup_df.groupby(c.VIDEO_ID_COL).size()
+
+            # Local Force = (Subgroup Reaction) - (Video Consensus)
+            local_marginal_force = subgroup_means - video_consensus.loc[subgroup_means.index]
+
+            # Aggregate to find the study-wide 'Signature' of the factor
+            avg_v_pull = (local_marginal_force[c.VALENCE] * counts).sum() / counts.sum()
+            avg_a_pull = (local_marginal_force[c.AROUSAL] * counts).sum() / counts.sum()
+
+            driver_data.append({
+                'factor': tag,
+                'valence_pull': avg_v_pull,
+                'arousal_pull': avg_a_pull,
+                'magnitude': np.sqrt(avg_v_pull ** 2 + avg_a_pull ** 2),
+                'type': 'Positive' if is_pf else 'Negative'
+            })
+
+    return pd.DataFrame(driver_data)
+
+
+def assign_affective_state(df):
+    """
+    Assign affective state based on valence and arousal values.
+    :param df: DataFrame with 'valence' and 'arousal' columns.
+    :return: DataFrame with added 'affective_state' column.
+    """
+    df["affective_state"] = np.select(
+        [
+            (df["valence"] > 0) & (df["arousal"] > 0),
+            (df["valence"] > 0) & (df["arousal"] <= 0),
+            (df["valence"] <= 0) & (df["arousal"] > 0),
+            (df["valence"] <= 0) & (df["arousal"] <= 0),
+        ],
+        c.AFFECTIVE_STATES,
+        default="Unknown",
+    )
+    return df
 
 
 def add_valence_arousal(
@@ -180,73 +299,690 @@ def add_valence_arousal(
     df[c.VALENCE] = valence
     df[c.AROUSAL] = arousal
 
+    # assign affective state
+    df = assign_affective_state(df)
+
     return df
 
 
 def calculate_video_level_scores(
         long_df: pd.DataFrame,
-        rating_col: str = 'rating',
-        grid_size: int = 10
+        output_path: Optional[Union[str, Path]] = None
 ) -> pd.DataFrame:
     """
-    Calculate video-level centroids for valence and arousal based on ratings.
-    :param long_df: DataFrame containing long-format data with video IDs and ratings.
-    :param rating_col: Column name containing the ratings (default is 'rating').
-    :param grid_size: Size of the rating grid (default is 10).
-    :return: DataFrame with video IDs and their corresponding valence and arousal centroids.
+    Video-level descriptive affect metrics (RQ1) + Structural Disagreement (RQ2).
+    Includes Energy Statistic (Distinctiveness) and GMM (Polarization).
     """
-    # TODO: Check if simple merge of the means for valence and arousal is sufficient
+    results = []
 
-    rows = []
+    # --- 1. SETUP GLOBAL POOL FOR DISTINCTIVENESS METRIC ---
+    global_affect = long_df[[c.VALENCE, c.AROUSAL]].dropna().to_numpy(float)
 
-    for vid in sorted(long_df[c.VIDEO_ID_COL].unique()):
-        ratings = pd.to_numeric(long_df.loc[long_df[c.VIDEO_ID_COL] == vid, rating_col], errors='coerce').dropna()
-        ratings = ratings[(ratings >= 1) & (ratings <= grid_size ** 2)].astype(int)
-        heatmap = np.zeros((grid_size, grid_size), int)
-        coords = ratings - 1
-        row_coords, col_coords = divmod(coords, grid_size)
-        np.add.at(heatmap, (row_coords, col_coords), 1)
+    # Subsample if too large (>5000) to speed up distance matrix calculation
+    if len(global_affect) > 5000:
+        rng = np.random.default_rng(42)
+        global_sample = rng.choice(global_affect, size=5000, replace=False)
+    else:
+        global_sample = global_affect
 
-        total = heatmap.sum()
-        if total == 0:
-            rows.append((vid, np.nan, np.nan))
+    # Calculate internal energy of the global pool (d_yy) ONCE.
+    d_yy = cdist(global_sample, global_sample, metric='euclidean').mean()
+
+    state_cols = [f"{s}_count" for s in c.AFFECTIVE_STATES]
+    grouped = long_df.groupby(c.VIDEO_ID_COL, sort=True, dropna=True)
+
+    for video_id, video_df in grouped:
+        video_affect = video_df[[c.VALENCE, c.AROUSAL]].dropna()
+        n_ratings = len(video_affect)
+
+        if n_ratings == 0:
             continue
 
-        X, Y = np.meshgrid(np.arange(grid_size), np.arange(grid_size))
-        center = 5
+        valence_values = video_affect[c.VALENCE].to_numpy(float)
+        arousal_values = video_affect[c.AROUSAL].to_numpy(float)
+        affect_points = np.column_stack([valence_values, arousal_values])
 
-        cx = (heatmap * X).sum() / total
-        cy = (heatmap * Y).sum() / total
+        # -------------------------------------------------
+        # OE: convert ordered labels
+        # -------------------------------------------------
+        oe_num = pd.Categorical(
+            video_df[c.OE], categories=c.OE_ORDER, ordered=True
+        ).codes.astype(float)
+        oe_num[oe_num < 0] = np.nan
+        oe_mean = float(np.nanmean(oe_num))
+        oe_mode = (
+            video_df[c.OE]
+            .value_counts()
+            .reindex(c.OE_ORDER, fill_value=0)
+            .idxmax()
+        )
 
-        norm_x = (cx - center) / center
-        norm_y = (center - cy) / center
-        rows.append((vid, norm_x, norm_y))
+        # -------------------------------------------------
+        # affect_state counts + entropy
+        # -------------------------------------------------
+        state_vc = (
+            video_df[c.AFFECT_STATE]
+            .value_counts()
+            .reindex(c.AFFECTIVE_STATES, fill_value=0)
+        )
+        state_counts = state_vc.tolist()
+        dominant_quadrant = state_vc.idxmax()
 
-    aggregated_df = pd.DataFrame(rows, columns=[c.VIDEO_ID_COL, c.VALENCE, c.AROUSAL])
+        total = float(state_vc.sum())
+        if total > 0:
+            p = (state_vc / total).to_numpy(float)
+            p = p[p > 0]
+            affect_state_entropy = round(float(-(p * np.log(p)).sum()), 2)
+        else:
+            affect_state_entropy = np.nan
 
-    return aggregated_df
+        # -------------------------------------------------
+        # per-dimension distribution summaries
+        # -------------------------------------------------
+        valence_mean = round(float(np.mean(valence_values)), 2)
+        arousal_mean = round(float(np.mean(arousal_values)), 2)
+
+        valence_sd = round(float(np.std(valence_values, ddof=1)), 2) if n_ratings > 1 else np.nan
+        arousal_sd = round(float(np.std(arousal_values, ddof=1)), 2) if n_ratings > 1 else np.nan
+
+        valence_skew = round(float(pd.Series(valence_values).skew()), 2) if n_ratings >= 3 else np.nan
+        arousal_skew = round(float(pd.Series(arousal_values).skew()), 2) if n_ratings >= 3 else np.nan
+
+        # -------------------------------------------------
+        # dispersion: mean distance to centroid
+        # -------------------------------------------------
+        dev = affect_points - np.array([valence_mean, arousal_mean])
+        distances = np.linalg.norm(dev, axis=1)
+        dispersion_mean_distance = round(float(distances.mean()), 2)
+
+        if n_ratings >= 2:
+            # Pairwise Euclidean distances over all i<j (length n(n-1)/2)
+            pw = pdist(affect_points, metric="euclidean")
+            pairwise_mean_distance = float(pw.mean())
+
+            # RMS pairwise distance (sqrt of mean squared pairwise distance)
+            pw2 = pw ** 2
+            pairwise_mean_sq_distance = float(pw2.mean())
+            pairwise_rms_distance = float(np.sqrt(pairwise_mean_sq_distance))
+        else:
+            pairwise_mean_distance = np.nan
+            pairwise_mean_sq_distance = np.nan
+            pairwise_rms_distance = np.nan
+
+        # A. Anisotropy (Structure of Disagreement)
+        pca = PCA(n_components=1)
+        pca.fit(affect_points)
+        # Scale: 0.5->1 (Original) becomes 0->1 (Scaled)
+        # 0 = Isotropic (Circular confusion), 1 = Anisotropic (Linear polarization)
+        raw_pca_ratio = pca.explained_variance_ratio_[0]
+        anisotropy_index = (raw_pca_ratio - 0.5) * 2.0
+        anisotropy_index = max(0.0, anisotropy_index)  # clip floating point errors
+
+        # -------------------------------------------------
+        # 4. Polarization Index (Structural Bimodality)
+        # -------------------------------------------------
+        polarization_index = 0.0
+
+        MIN_SEPARATION = 0.5
+        BIC_MARGIN = 6.0  # 2-comp must beat 1-comp by >2.0 bits
+        MIN_N = 15
+
+        if n_ratings >= MIN_N:
+            try:
+                # 1. Fit 1-Component Model (Baseline)
+                gmm1 = GaussianMixture(n_components=1, n_init=10, random_state=42,
+                                       reg_covar=1e-4).fit(affect_points)
+                bic1 = gmm1.bic(affect_points)
+
+                # 2. Fit 2-Component Model (Bimodal Hypothesis)
+                gmm2 = GaussianMixture(n_components=2, n_init=10, random_state=42,
+                                       reg_covar=1e-4).fit(affect_points)
+                bic2 = gmm2.bic(affect_points)
+
+                # Calculate metrics
+                delta_bic = bic1 - bic2
+                mu1 = gmm2.means_[0]
+                mu2 = gmm2.means_[1]
+                dist = np.linalg.norm(mu1 - mu2)
+
+                # 3. Robust Decision Logic - ONLY assign if thresholds pass
+                if delta_bic >= BIC_MARGIN and dist >= MIN_SEPARATION:
+                    polarization_index = float(dist)
+                else:
+                    polarization_index = 0.0
+
+            except Exception as e:
+                log.warning(f"Video {video_id}: GMM fitting failed - {e}")
+                polarization_index = np.nan
+                delta_bic = np.nan
+        else:
+            # Not enough data
+            polarization_index = np.nan
+
+        # C. Distinctiveness Metric (Energy Statistic)
+        # A simpler implementation of earth mover's distance.
+        if n_ratings >= 5:
+            d_xy = cdist(affect_points, global_sample, metric='euclidean').mean()
+            d_xx = cdist(affect_points, affect_points, metric='euclidean').mean()
+            dist_distinctiveness = 2 * d_xy - d_xx - d_yy
+        else:
+            dist_distinctiveness = np.nan
+
+        # -------------------------------------------------
+        # covariance matrix elements
+        # -------------------------------------------------
+        if n_ratings > 1:
+            cov_mat = np.cov(affect_points.T, ddof=1)
+            var_valence = float(cov_mat[0, 0])
+            var_arousal = float(cov_mat[1, 1])
+            cov_valence_arousal = float(cov_mat[0, 1])
+            cov_trace = var_valence + var_arousal
+
+            valence_arousal_pearson_r = float(
+                np.corrcoef(valence_values, arousal_values)[0, 1]
+            )
+            dispersion_area_cov = round(float(np.linalg.det(cov_mat)), 6)
+        else:
+            var_valence, var_arousal = np.nan, np.nan
+            cov_valence_arousal, cov_trace = np.nan, np.nan
+            valence_arousal_pearson_r, dispersion_area_cov = np.nan, np.nan
+
+        # -------------------------------------------------
+        # Correlations (for sanity checks)
+        # -------------------------------------------------
+        va_rho = np.nan
+        if n_ratings >= 3:
+            va_rho, _ = spearmanr(valence_values, arousal_values)
+
+        valence_oe_rho, arousal_oe_rho = np.nan, np.nan
+        corr_df = video_df[[c.VALENCE, c.AROUSAL, c.OE]].dropna()
+        if len(corr_df) >= 3:
+            corr_oe_num = pd.Categorical(
+                corr_df[c.OE], categories=c.OE_ORDER, ordered=True
+            ).codes.astype(float)
+            corr_oe_num[corr_oe_num < 0] = np.nan
+
+            if np.isfinite(corr_oe_num).sum() >= 3:
+                valence_oe_rho, _ = spearmanr(corr_df[c.VALENCE].to_numpy(float), corr_oe_num)
+                arousal_oe_rho, _ = spearmanr(corr_df[c.AROUSAL].to_numpy(float), corr_oe_num)
+
+        results.append([
+            video_id,
+            round(valence_mean, 2),
+            round(valence_sd, 2),
+            round(valence_skew, 2),
+            round(arousal_mean, 2),
+            round(arousal_sd, 2),
+            round(arousal_skew, 2),
+            round(var_valence, 2),
+            round(var_arousal, 2),
+            round(cov_valence_arousal, 2),
+            round(cov_trace, 2),
+            round(polarization_index, 2),
+            round(delta_bic, 2),
+            round(dist_distinctiveness, 2),
+            round(anisotropy_index, 2),
+            round(valence_arousal_pearson_r, 2),
+            round(dispersion_mean_distance, 2),
+            round(pairwise_mean_distance, 2),
+            round(pairwise_rms_distance, 2),
+            round(pairwise_mean_sq_distance, 6),
+            round(dispersion_area_cov, 2),
+            round(va_rho, 2),
+            round(oe_mean, 2),
+            oe_mode,
+            round(valence_oe_rho, 2),
+            round(arousal_oe_rho, 2),
+            round(affect_state_entropy, 2),
+            dominant_quadrant,
+            *state_counts
+        ])
+
+    cols = [
+        c.VIDEO_ID_COL,
+        "valence_mean",
+        "valence_sd",
+        "valence_skewness",
+        "arousal_mean",
+        "arousal_sd",
+        "arousal_skewness",
+        "valence_variance",
+        "arousal_variance",
+        "valence_arousal_covariance",
+        "covariance_trace",
+        "polarization_index",
+        "delta_bic",
+        "dist_distinctiveness",
+        "anisotropy_index",
+        "valence_arousal_pearson_r",
+        "dispersion_mean_distance",
+        "pairwise_mean_distance",
+        "pairwise_rms_distance",
+        "pairwise_mean_sq_distance",
+        "dispersion_area_covariance",
+        "valence_arousal_spearman_rho",
+        "oe_mean",
+        "oe_mode",
+        "valence_oe_spearman_rho",
+        "arousal_oe_spearman_rho",
+        "affect_state_entropy",
+        "dominant_quadrant",
+        *state_cols
+    ]
+
+    results = pd.DataFrame(results, columns=cols)
+
+    if output_path is not None:
+        results.to_csv(output_path, index=False)
+
+    return results
 
 
-def add_midpoint_centered_column(
-        df: pd.DataFrame,
-        col_name: str,
-        category_order: list,
+def calculate_video_level_scores_by_subgroup(
+        long_df: pd.DataFrame,
+        subgroup_col: str,
+        min_participants: int = 15,
+        output_path: Optional[Union[str, Path]] = None
+) -> pd.DataFrame:
+
+    results = []
+
+    if subgroup_col not in long_df.columns:
+        raise ValueError(f"{subgroup_col} not found in dataframe.")
+
+    for level, df_sub in long_df.groupby(subgroup_col):
+
+        # ensure subgroup has enough participants
+        n_participants = df_sub["participant_id"].nunique()
+        if n_participants < min_participants:
+            continue
+
+        video_scores = calculate_video_level_scores(df_sub)
+        video_scores[subgroup_col] = level
+        video_scores["n_participants"] = n_participants
+        results.append(video_scores)
+
+    if not results:
+        return pd.DataFrame()
+
+    out = pd.concat(results, ignore_index=True)
+
+    if output_path is not None:
+        out.to_csv(output_path, index=False)
+
+    return out
+
+
+def bayesian_gmm(
+    coords: np.ndarray,
+    max_components: int = 5,
+    weight_concentration_prior: float = 0.1,
+    active_weight_thresh: float = 0.01,
+    active_min_count: int = 20,
+) -> Dict:
+
+    n_samples = len(coords)
+    if n_samples < 4:
+        return {"n_active_components": 0, "interpretation": "insufficient_data"}
+
+    bgmm = BayesianGaussianMixture(
+        n_components=max_components,
+        weight_concentration_prior=weight_concentration_prior,
+        covariance_type="full",
+        max_iter=200,
+        random_state=42,
+        n_init=5,
+    )
+    bgmm.fit(coords)
+
+    weights = bgmm.weights_
+    responsibilities = bgmm.predict_proba(coords)
+    assignments = bgmm.predict(coords)
+
+    counts = np.bincount(assignments, minlength=max_components)
+    active_mask = (weights >= active_weight_thresh) & (counts >= active_min_count)
+    active_ids = np.where(active_mask)[0]
+    n_active = int(len(active_ids))
+
+    if n_active == 0:
+        return {"n_active_components": 0, "interpretation": "degenerate"}
+
+    # Remap assignments to active index space: active -> 0..n_active-1, inactive -> -1
+    remap = {old: new for new, old in enumerate(active_ids)}
+    assignments_remapped = np.array([remap.get(a, -1) for a in assignments], dtype=int)
+
+    active_weights = weights[active_ids]
+    active_means = bgmm.means_[active_ids]
+    active_covs = bgmm.covariances_[active_ids]
+
+    # Separation between "camps"
+    if n_active > 1:
+        mean_separation = float(np.mean(pdist(active_means, metric="euclidean")))
+        within_spread = float(np.mean([np.sqrt(np.trace(cov)) for cov in active_covs]))
+        separation_ratio = mean_separation / (within_spread + 1e-9)
+    else:
+        mean_separation = 0.0
+        separation_ratio = 0.0
+
+    # Interpretation (your logic, unchanged)
+    if n_active == 1:
+        interp = "strong_consensus"
+    elif n_active == 2:
+        interp = "clear_polarization" if separation_ratio > 1.5 else "weak_bimodality"
+    elif n_active == 3:
+        interp = "tripartite_camps"
+    else:
+        interp = "fragmented_opinions"
+
+    return {
+        "n_active_components": n_active,
+        "component_weights": [round(float(w), 3) for w in active_weights],
+        "component_means": [
+            {"valence": round(float(m[0]), 3), "arousal": round(float(m[1]), 3)}
+            for m in active_means
+        ],
+        "mean_separation": round(mean_separation, 3),
+        "separation_ratio": round(separation_ratio, 2),
+        "assignments": assignments_remapped.tolist(),
+        "max_responsibility": round(float(responsibilities.max(axis=1).mean()), 3),
+        "interpretation": interp,
+    }
+
+
+def add_factor_counts_to_scores(
+        scores_df,
+        survey_df,
+        label_cols: Sequence[str],
+        video_col: str = c.VIDEO_ID_COL,
+        pf_col: str = c.PF,
+        nf_col: str = c.NF,
+   ) -> pd.DataFrame:
+
+    label_counts = build_factor_counts_by_video(
+        survey_df,
+        label_cols=label_cols,
+        video_col=video_col,
+        pf_col=pf_col,
+        nf_col=nf_col
+    )
+
+    # Merge label counts with video-level scores, filling missing values with 0
+    video_level_scores = scores_df.merge(label_counts, on=c.VIDEO_ID_COL, how="left")
+    video_level_scores[c.LABEL_COLS] = video_level_scores[c.LABEL_COLS].fillna(0).astype(int)
+    return video_level_scores
+
+
+def build_factor_counts_by_video(
+    df: pd.DataFrame,
+    label_cols: Sequence[str],
+    video_col: str = c.VIDEO_ID_COL,
+    pf_col: str = c.PF,
+    nf_col: str = c.NF,
 ) -> pd.DataFrame:
     """
-    Add a new column to the DataFrame with values centered around the midpoint of the category order.
-    :param df: DataFrame to modify.
-    :param col_name: Column name containing the categorical data.
-    :param category_order: List of categories in the desired order.
-    :return: DataFrame with the new centered column.
+    One row per video; columns in `label_cols` filled with counts (ints).
+    Assumes PF/NF entries are strings like "A;B;C;" (trailing ';' ok).
+    Missing labels remain 0 (never NaN).
     """
 
-    # Dynamically calculate the midpoint from the category list
-    midpoint = len(category_order) // 2
-    codes = pd.Categorical(df[col_name], categories=category_order, ordered=True).codes
-    new_col_name = f"{col_name}_centered"
-    df[new_col_name] = codes - midpoint
+    def parse_labels(x):
+        if pd.isna(x):
+            return []
+        parts = [p.strip() for p in re.split(r"[;,]", str(x))]
+        return [p for p in parts if p]
 
-    return df
+    vids = pd.DataFrame({video_col: sorted(df[video_col].dropna().unique())})
+    out = vids.copy()
+    for col in label_cols:
+        out[col] = 0
+
+    def accumulate(source_col: str, prefix: str):
+        t = df[[video_col, source_col]].dropna().copy()
+        t["label"] = t[source_col].apply(parse_labels)
+        t = t.explode("label")
+        t = t[t["label"].notna() & (t["label"] != "")]
+        if t.empty:
+            return
+
+        counts = (t.groupby([video_col, "label"]).size()
+                    .rename("count")
+                    .reset_index())
+        counts["colname"] = prefix + ": " + counts["label"].astype(str)
+
+        for _, r in counts.iterrows():
+            colname = r["colname"]
+            if colname not in out.columns:
+                continue
+            out.loc[out[video_col] == r[video_col], colname] = int(r["count"])
+
+    accumulate(pf_col, "PF")
+    accumulate(nf_col, "NF")
+
+    return out
+
+
+def shannon_entropy_from_counts(counts: np.ndarray) -> float:
+    """Shannon entropy for a vector of nonnegative counts."""
+    counts = np.asarray(counts, dtype=float)
+    s = counts.sum()
+    if s <= 0:
+        return 0.0
+    p = counts / s
+    p = p[p > 0]
+    return float(-(p * np.log(p)).sum())
+
+
+def pf_nf_disagreement_analysis(
+            video_level_scores: pd.DataFrame,
+            label_cols: List[str],
+            out_csv_path=None,
+            n_hi_lo: int = 10,
+):
+    """
+    RQ2 analysis: relate affect-disagreement structure to PF/NF cue structure.
+    """
+
+    d = video_level_scores.copy()
+
+    # ----------------------------
+    # 0) Identify PF / NF columns
+    # ----------------------------
+    pf_cols = [c for c in label_cols if c.startswith("PF:")]
+    nf_cols = [c for c in label_cols if c.startswith("NF:")]
+
+    for col in pf_cols + nf_cols:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0).astype(int)
+        else:
+            d[col] = 0
+
+    # ----------------------------
+    # 1) Disagreement flags
+    # ----------------------------
+    d["flag_high_dispersion"] = (
+        d["dispersion_mean_distance"] > d["dispersion_mean_distance"].median()
+        if "dispersion_mean_distance" in d.columns else False
+    )
+
+    d["flag_high_polarization"] = (
+        d["anisotropy_index"] > d["anisotropy_index"].median()
+        if "anisotropy_index" in d.columns else False
+    )
+
+    d["flag_multimodal"] = (
+        pd.to_numeric(d["polarization_index"], errors="coerce").fillna(0) > 0.0
+        if "polarization_index" in d.columns else False
+    )
+
+    # ----------------------------
+    # 2) PF/NF STRUCTURE metrics
+    # ----------------------------
+    d["pf_total_count"] = d[pf_cols].sum(axis=1)
+    d["nf_total_count"] = d[nf_cols].sum(axis=1)
+
+    # mixed signals (both PF and NF present)
+    d["pf_nf_overlap_count"] = d[["pf_total_count", "nf_total_count"]].min(axis=1)
+
+    # how diverse cue selection is
+    d["pf_label_entropy"] = d[pf_cols].apply(lambda r: shannon_entropy_from_counts(r.values), axis=1)
+    d["nf_label_entropy"] = d[nf_cols].apply(lambda r: shannon_entropy_from_counts(r.values), axis=1)
+    d["pf_nf_label_entropy"] = d[pf_cols + nf_cols].apply(
+        lambda r: shannon_entropy_from_counts(r.values), axis=1
+    )
+
+    # ----------------------------
+    # 3) Hi vs Lo dispersion contrasts
+    # ----------------------------
+    if "dispersion_mean_distance" in d.columns:
+        n = min(n_hi_lo, len(d))
+        hi = d.nlargest(n, "dispersion_mean_distance")
+        lo = d.nsmallest(n, "dispersion_mean_distance")
+
+        hi_lo_diff = hi[label_cols].mean() - lo[label_cols].mean()
+        hi_lo_diff = hi_lo_diff.sort_values(ascending=False)
+    else:
+        hi_lo_diff = pd.Series()
+
+    # ----------------------------
+    # 4) Save enriched dataset
+    # ----------------------------
+    if out_csv_path is not None:
+        d.to_csv(out_csv_path, index=False)
+
+    return d, hi_lo_diff
+
+
+def compute_video_reliability(long_df, n_splits=10):
+    """
+    Test whether disagreement is systematic or noise.
+    Split participants randomly, compute metrics for each split,
+    correlate across splits.
+    """
+    results = []
+    for split in range(n_splits):
+        # Random split
+        participants = long_df['participant_id'].unique()
+        np.random.shuffle(participants)
+        split_point = len(participants) // 2
+
+        split_A = participants[:split_point]
+        split_B = participants[split_point:]
+
+        # Compute metrics for each video in each split
+        metrics_A = calculate_video_level_scores(
+            long_df[long_df['participant_id'].isin(split_A)]
+        )
+        metrics_B = calculate_video_level_scores(
+            long_df[long_df['participant_id'].isin(split_B)]
+        )
+
+        # Correlate
+        for metric in ['valence_mean', 'arousal_mean', 'dispersion_mean_distance', 'anisotropy_index', "affect_state_entropy"]:
+            merged = metrics_A.merge(metrics_B, on='video_id', suffixes=('_A', '_B'))
+            r = spearmanr(merged[f'{metric}_A'], merged[f'{metric}_B'])[0]
+            results.append({'split': split, 'metric': metric, 'correlation': r})
+
+    return pd.DataFrame(results)
+
+
+def fit_lmm_and_extract_metrics(formula, df_model, baseline_aic, baseline_bic):
+    model = smf.mixedlm(
+        formula,
+        df_model,
+        groups=df_model[c.PARTICIPANT_ID],
+    )
+
+    fit = model.fit(reml=False, method='powell')
+
+    interaction_key = [k for k in fit.params.index if ':' in k][0]
+    metric_key = [k for k in fit.params.index if 'z_' in k and ':' not in k][0]
+
+    return {
+        "AIC": fit.aic,
+        "BIC": fit.bic,
+        "Delta_AIC": fit.aic - baseline_aic,
+        "Delta_BIC": fit.bic - baseline_bic,
+        "Interaction_Beta": fit.params[interaction_key],
+        "Interaction_Pval": fit.pvalues[interaction_key],
+        "Main_Effect_Beta": fit.params[metric_key],
+        "Main_Effect_Pval": fit.pvalues[metric_key],
+    }
+
+
+def prepare_lmm_dataframe(video_level_scores, survey_results_df, metrics):
+    clip_features = video_level_scores[[c.VIDEO_ID_COL] + metrics].copy()
+
+    for col in metrics:
+        clip_features[f'z_{col}'] = (clip_features[col] - clip_features[col].mean()) / clip_features[col].std(ddof=0)
+
+    df_model = survey_results_df.merge(clip_features, on=c.VIDEO_ID_COL, how='left')
+
+    df_model['z_valence'] = (df_model[c.VALENCE] - df_model[c.VALENCE].mean()) / df_model[c.VALENCE].std(ddof=0)
+    df_model['z_arousal'] = (df_model[c.AROUSAL] - df_model[c.AROUSAL].mean()) / df_model[c.AROUSAL].std(ddof=0)
+
+    return df_model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#-------------------------------------------------------------
+# Additional utility functions
+#-------------------------------------------------------------
 
 
 def filter_by_group_size(
@@ -268,57 +1004,6 @@ def filter_by_group_size(
 
     # Filter the original DataFrame and return a copy
     return df[df[group_col].isin(valid_categories)].copy()
-
-
-def factor_counts(
-        df: pd.DataFrame,
-        col: str,
-        prefix: str,
-        group_by: str = c.VIDEO_ID_COL
-) -> pd.DataFrame:
-    """
-    Create a DataFrame with counts of unique labels in a specified column, grouped by video_id.
-    :param df: DataFrame containing the data.
-    :param col: Column name containing the labels to count.
-    :param prefix: Prefix to add to the label columns in the output DataFrame.
-    :param group_by: Column name to group by (default is 'video_id').
-    :return: DataFrame with video_id and counts of unique labels.
-    """
-    t = (df[[group_by, col]]
-         .assign(label=lambda d: d[col].fillna('').str.split(';'))
-         .explode('label'))
-    t = t.loc[t['label'] != '']
-    if t.empty:
-        return pd.DataFrame({group_by: []})
-    return (t.groupby([group_by, 'label']).size()
-            .unstack(fill_value=0)
-            .add_prefix(f'{prefix}: ')
-            .reset_index())
-
-
-def aggregate_video_level_scores(
-        df: pd.DataFrame,
-        group_by: str = c.VIDEO_ID_COL,
-) -> pd.DataFrame:
-    """
-    Aggregate video-level scores from a long DataFrame containing valence and arousal scores.
-    :param df: DataFrame containing the scores with columns 'video_id', 'valence', and 'arousal'.
-    :param group_by: Column name to group by (default is 'video_id').
-    :return: DataFrame with aggregated scores and counts of PF and NF factors.
-    """
-    video_level_scores = calculate_video_level_scores(df, rating_col=c.AG)
-
-    pf_counts = factor_counts(df, c.PF, c.PF, group_by)
-    nf_counts = factor_counts(df, c.NF, c.NF, group_by)
-
-    video_level_scores = (video_level_scores
-                          .merge(pf_counts, on=group_by, how='left')
-                          .merge(nf_counts, on=group_by, how='left'))
-
-    count_cols = video_level_scores.filter(regex=r'^(PF|NF): ').columns
-    video_level_scores[count_cols] = video_level_scores[count_cols].fillna(0)
-
-    return video_level_scores
 
 
 def aggregate_video_level_geometry(
@@ -757,25 +1442,3 @@ def prepare_combined_scenario_df(
     df_combined['NB_count'] = df_combined['sequence_list'].apply(lambda seq: seq.count('NB'))
 
     return df_combined
-
-
-def assign_affective_states(survey_results_df):
-    """
-    Assign affective states based on valence and arousal scores.
-    :param survey_results_df: DataFrame containing 'valence' and 'arousal' columns.
-    :return: DataFrame with an additional 'affective_state' column.
-    """
-    conditions = [
-        (survey_results_df['valence'] > 0) & (survey_results_df['arousal'] > 0),
-        (survey_results_df['valence'] > 0) & (survey_results_df['arousal'] <= 0),
-        (survey_results_df['valence'] <= 0) & (survey_results_df['arousal'] > 0),
-        (survey_results_df['valence'] <= 0) & (survey_results_df['arousal'] <= 0)
-    ]
-
-    categories = ['Activation', 'Contentment', 'Tension', 'Deactivation']
-    survey_results_df['affective_state'] = np.select(conditions, categories, default='Unknown')
-
-    for cat in categories:
-        survey_results_df[f'is_{cat}'] = (survey_results_df['affective_state'] == cat).astype(int)
-
-    return survey_results_df

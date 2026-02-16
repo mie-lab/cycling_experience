@@ -1,16 +1,24 @@
-import pandas as pd
-from matplotlib.lines import Line2D
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
-from pathlib import Path
 from scipy.spatial import ConvexHull
 from matplotlib.patches import Patch
 import matplotlib.patches as mpatches
-from typing import Tuple, Dict, Optional, List
 from collections import Counter
-import constants as c
 from PIL import Image
+from typing import Any, Optional, Sequence, Tuple, Dict, List, Union
+import seaborn as sns
+import matplotlib as mpl
+import re
+from matplotlib.lines import Line2D
+import constants as c
+import scipy.stats as stats
+from scipy.stats import ttest_ind
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from adjustText import adjust_text
+import matplotlib.colors as mcolors
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
 
 
 # ---  Plotting functions for survey data analysis ---
@@ -49,6 +57,506 @@ def plot_overall_experience(
     else:
         fig.tight_layout()
         plt.show()
+
+
+def plot_affect_grid_subplots(
+    df: pd.DataFrame,
+    video_id: Optional[Any] = None,
+    save_path: Optional[Path] = None,
+    ncols: int = 5,
+    nrows: int = 6,
+    normalize: str = "count",
+    robust_vmax_percentile: Optional[float] = None
+) -> None:
+    """
+    Plot heatmaps of Affect Grid usage for multiple videos in a grid layout.
+    """
+
+    if video_id is None:
+        vids = sorted(df[c.VIDEO_ID_COL].dropna().unique())
+    elif isinstance(video_id, (list, tuple, set, pd.Series, np.ndarray)):
+        vids = sorted(set(int(v) for v in video_id))
+    else:
+        vids = [int(video_id)]
+    vids = vids[: ncols * nrows]
+
+    grids = []
+    for vid in vids:
+        ag = pd.to_numeric(df.loc[df[c.VIDEO_ID_COL] == vid, c.AG], errors="coerce").dropna()
+        ag = ag[(ag >= 1) & (ag <= 100)].astype(int).to_numpy()
+
+        counts = np.bincount(ag - 1, minlength=100).reshape(10, 10).astype(float)
+        if normalize == "percent" and counts.sum() > 0:
+            counts = counts / counts.sum() * 100.0
+        grids.append((vid, counts))
+
+    all_vals = np.concatenate([g.ravel() for _, g in grids]) if grids else np.array([0.0])
+    vmin, vmax = 0.0, float(np.nanmax(all_vals))
+    if robust_vmax_percentile is not None:
+        vmax = float(np.percentile(all_vals, robust_vmax_percentile))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.1, nrows * 3.1))
+    axes = np.ravel(axes)
+    cmap = plt.get_cmap("YlGnBu")
+
+    for ax, (vid, grid) in zip(axes, grids):
+        sns.heatmap(grid, ax=ax, cmap=cmap, vmin=vmin, vmax=vmax,
+                    cbar=False, square=True, xticklabels=False, yticklabels=False)
+        ax.set_title(f"{vid}", fontsize=16, pad=1)
+
+    for ax in axes[len(grids):]:
+        ax.axis("off")
+
+    sm = mpl.cm.ScalarMappable(norm=mpl.colors.Normalize(vmin=vmin, vmax=vmax), cmap=cmap)
+    sm.set_array([])
+    cax = fig.add_axes([0.15, 0.06, 0.7, 0.02])
+    cbar = fig.colorbar(sm, cax=cax, orientation="horizontal")
+    cbar.set_label("Response Count" if normalize == "count" else "% of responses", fontsize=18)
+    cbar.ax.tick_params(labelsize=14)
+    fig.subplots_adjust(top=0.93, bottom=0.10, hspace=0.15, wspace=0.08)
+    fig.suptitle("Affect Grid Heatmaps by Cycling Scenario ID", fontsize=18, y=0.975, fontweight="bold")
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_bgmm_clusters_subplots(
+    points_df: pd.DataFrame,
+    video_id: Optional[Any] = None,
+    save_path: Optional[Path] = None,
+    ncols: int = 5,
+    nrows: int = 6,
+    # columns
+    video_col: str = "video_id",
+    x_col: str = "valence",
+    y_col: str = "arousal",
+    cluster_col: str = "cluster",
+    # styling / behavior
+    show_means: bool = True,
+    means_df: Optional[pd.DataFrame] = None,   # optional: precomputed means for each video+cluster
+    means_cols: tuple[str, str] = ("mean_valence", "mean_arousal"),
+    alpha: float = 0.55,
+    s: float = 12,
+    mean_marker_size: float = 80,
+    xlim: tuple[float, float] = (-1.0, 1.0),
+    ylim: tuple[float, float] = (-1.0, 1.0),
+    legend: bool = False,
+) -> None:
+    # ---- pick videos ----
+    if video_id is None:
+        vids = sorted(points_df[video_col].dropna().unique())
+    elif isinstance(video_id, (list, tuple, set, pd.Series, np.ndarray)):
+        vids = sorted(set(int(v) for v in video_id))
+    else:
+        vids = [int(video_id)]
+    vids = vids[: ncols * nrows]
+
+    # ---- set up figure ----
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.1, nrows * 3.1))
+    axes = np.ravel(axes)
+
+    # ---- global color mapping (stable across panels) ----
+    # Collect all cluster labels across selected vids (excluding NaN)
+    sub = points_df[points_df[video_col].isin(vids)]
+    cl = pd.to_numeric(sub[cluster_col], errors="coerce").dropna().astype(int)
+    # keep -1 if present; otherwise just 0..K-1
+    uniq_clusters = sorted(cl.unique().tolist())
+
+    # Use a qualitative colormap; tab20 is fine up to 20 clusters
+    cmap = plt.get_cmap("tab20")
+    def color_for(k: int):
+        if k == -1:
+            return (0.6, 0.6, 0.6, 1.0)  # grey for unassigned
+        return cmap(k % cmap.N)
+
+    # ---- plot each video ----
+    for ax, vid in zip(axes, vids):
+        vdf = points_df.loc[points_df[video_col] == vid, [x_col, y_col, cluster_col]].copy()
+        vdf[x_col] = pd.to_numeric(vdf[x_col], errors="coerce")
+        vdf[y_col] = pd.to_numeric(vdf[y_col], errors="coerce")
+        vdf[cluster_col] = pd.to_numeric(vdf[cluster_col], errors="coerce")
+        vdf = vdf.dropna()
+
+        ax.set_title(f"{vid}", fontsize=16, pad=1)
+
+        # draw by cluster to keep colors consistent
+        for k in uniq_clusters:
+            kdf = vdf[vdf[cluster_col].astype(int) == k]
+            if kdf.empty:
+                continue
+            ax.scatter(
+                kdf[x_col].to_numpy(),
+                kdf[y_col].to_numpy(),
+                s=s,
+                alpha=alpha,
+                c=[color_for(int(k))],
+                linewidths=0,
+            )
+
+        # overlay means (either compute from points or use provided means_df)
+        if show_means:
+            if means_df is None:
+                # compute point-means per cluster for this video
+                if not vdf.empty:
+                    g = vdf.groupby(vdf[cluster_col].astype(int))[[x_col, y_col]].mean()
+                    for k, row in g.iterrows():
+                        ax.scatter(
+                            [row[x_col]], [row[y_col]],
+                            s=mean_marker_size,
+                            c=[color_for(int(k))],
+                            marker="X",
+                            edgecolors="black",
+                            linewidths=0.7,
+                            zorder=5
+                        )
+            else:
+                mv = means_df[means_df[video_col] == vid]
+                for _, r in mv.iterrows():
+                    k = int(r[cluster_col])
+                    ax.scatter(
+                        [r[means_cols[0]]], [r[means_cols[1]]],
+                        s=mean_marker_size,
+                        c=[color_for(k)],
+                        marker="X",
+                        edgecolors="black",
+                        linewidths=0.7,
+                        zorder=5
+                    )
+
+        # axes formatting
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.axhline(0, linewidth=0.8, alpha=0.3)
+        ax.axvline(0, linewidth=0.8, alpha=0.3)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_aspect("equal", adjustable="box")
+
+    # turn off unused axes
+    for ax in axes[len(vids):]:
+        ax.axis("off")
+
+    # optional legend (global, minimal)
+    if legend and uniq_clusters:
+        handles = []
+        labels = []
+        for k in uniq_clusters:
+            handles.append(plt.Line2D([0], [0], marker='o', linestyle='',
+                                     markerfacecolor=color_for(int(k)), markersize=8,
+                                     markeredgewidth=0))
+            labels.append(f"cluster {k}")
+        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 8),
+                   frameon=False, bbox_to_anchor=(0.5, 0.03))
+
+    fig.subplots_adjust(top=0.93, bottom=0.08, hspace=0.15, wspace=0.08)
+    fig.suptitle("BGMM Valence–Arousal Clusters by Video", fontsize=18, y=0.975)
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_affect_grid_usage_with_marginals(
+    df: pd.DataFrame,
+    ag_col: str = "AG",
+    save_path: Optional[Path] = None,
+    normalize: str = "percent",   # "count" or "percent"
+    cmap: str = "YlGnBu"
+) -> None:
+
+    # 1. build 10×10 grid
+    ag = pd.to_numeric(df[ag_col], errors="coerce").dropna()
+    ag = ag[(ag >= 1) & (ag <= 100)].astype(int).to_numpy()
+    grid = np.bincount(ag - 1, minlength=100).reshape(10, 10).astype(float)
+
+    if normalize == "percent" and grid.sum() > 0:
+        grid /= grid.sum()
+        grid *= 100.0
+        cbar_label = "% of responses"
+    else:
+        cbar_label = "Response Count"
+
+    valence_dist = grid.sum(axis=0)
+    arousal_dist = grid.sum(axis=1)
+
+    # 2. derive per-bar colors from the colormap
+    cm = plt.get_cmap(cmap)
+
+    # 3. create figure with four axes (no shared axes)
+    fig = plt.figure(figsize=(8, 8))
+
+    ax_main = fig.add_axes([0.12, 0.12, 0.65, 0.65])
+    ax_top = fig.add_axes([0.12, 0.78, 0.65, 0.12])
+    ax_right = fig.add_axes([0.78, 0.12, 0.12, 0.65])
+    ax_cbar = fig.add_axes([0.12, 0.06, 0.65, 0.03])
+
+    #  4. main heatmap
+    sns.heatmap(
+        grid,
+        ax=ax_main,
+        cmap=cmap,
+        cbar=False,
+        xticklabels=False,
+        yticklabels=False,
+        annot=(normalize != "percent"),
+        fmt=".0f",
+        annot_kws={"fontsize": 12}
+    )
+    ax_main.set_xlim(0, 10)
+    ax_main.set_ylim(10, 0)
+    ax_main.set_aspect("equal", adjustable="box")
+    ax_main.set_anchor("NW")
+    ax_main.axhline(5, color="darkgrey", lw=1)
+    ax_main.axvline(5, color="darkgrey", lw=1)
+
+    #  5. draw once so the equal-aspect box is finalised
+    fig.canvas.draw()
+
+    # 6. read actual pixel bbox of the heatmap
+    main_bbox = ax_main.get_window_extent(fig.canvas.get_renderer())
+    fig_w, fig_h = fig.get_size_inches() * fig.dpi
+
+    x0 = main_bbox.x0 / fig_w
+    y0 = main_bbox.y0 / fig_h
+    w = main_bbox.width / fig_w
+    h = main_bbox.height / fig_h
+
+    # 7. top histogram
+    gap_top = 0.008
+    hist_h = 0.07
+    ax_top.set_position([x0, y0 + h + gap_top, w, hist_h])
+    ax_top.set_xlim(0, 10)
+    ax_top.set_ylim(0, valence_dist.max() * 1.15)
+    ax_top.bar(
+        np.arange(10), valence_dist,
+        width=1.0, align="edge",
+        color='lightgrey', edgecolor="white", linewidth=1.2, alpha=0.7
+    )
+    ax_top.axis("off")
+    ax_top.text(0.5, 1.15, "Valence [-1, 1]", transform=ax_top.transAxes,
+                ha="center", va="bottom", fontsize=18,  color="#333")
+
+    # 8. right histogram
+    gap_right = 0.008
+    hist_w = 0.06
+    ax_right.set_position([x0 + w + gap_right, y0, hist_w, h])
+    ax_right.set_ylim(10, 0)
+    ax_right.set_xlim(0, arousal_dist.max() * 1.15)
+    ax_right.barh(
+        np.arange(10), arousal_dist,
+        height=1.0, align="edge",
+        color='lightgrey', edgecolor="white", linewidth=1.2, alpha=0.7
+    )
+    ax_right.axis("off")
+    ax_right.text(1.15, 0.5, "Arousal [1, -1]", transform=ax_right.transAxes,
+                  ha="left", va="center", rotation=270, fontsize=16, color="#333")
+
+    # 9. colorbar
+    gap_cbar = 0.025
+    cbar_h = 0.025
+    ax_cbar.set_position([x0, y0 - gap_cbar - cbar_h, w, cbar_h])
+    norm = mpl.colors.Normalize(vmin=float(grid.min()), vmax=float(grid.max()))
+    sm = mpl.cm.ScalarMappable(norm=norm, cmap=cm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=ax_cbar, orientation="horizontal")
+    cbar.set_label(cbar_label, fontsize=16)
+    cbar.ax.tick_params(labelsize=14)
+
+    fig.suptitle("Overall Affect Grid Usage", fontsize=16, x=0.45, y=0.94, fontweight="bold")
+
+    # 12. save / show
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_valence_arousal_by_oe(
+    df: pd.DataFrame,
+    oe_col: str,
+    oe_order: Sequence[str],
+    valence_col: str,
+    arousal_col: str,
+    save_path: Optional[Path] = None,
+    kind: str = "violin",  # "violin" or "box"
+    cmap: str = "YlGnBu",
+) -> None:
+
+    d = df[[oe_col, valence_col, arousal_col]].dropna().copy()
+    d[oe_col] = pd.Categorical(d[oe_col], categories=list(oe_order), ordered=True)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    if kind not in {"violin", "box"}:
+        raise ValueError("kind must be 'violin' or 'box'")
+
+    common_kwargs = dict(
+        data=d,
+        x=oe_col,
+        order=list(oe_order),
+        hue=oe_col,
+        palette=cmap,
+        legend=False
+    )
+
+    # ---- Valence ----
+    if kind == "violin":
+        sns.violinplot(y=valence_col, ax=axes[0], inner="quartile", **common_kwargs)
+    else:
+        sns.boxplot(y=valence_col, ax=axes[0], **common_kwargs)
+
+    axes[0].axhline(0, color="grey", lw=1, alpha=0.4)
+    axes[0].set_title("Valence distribution by Overall Experience", fontsize=16)
+    axes[0].set_ylabel("Valence")
+
+    # ---- Arousal ----
+    if kind == "violin":
+        sns.violinplot(y=arousal_col, ax=axes[1], inner="quartile", **common_kwargs)
+    else:
+        sns.boxplot(y=arousal_col, ax=axes[1], **common_kwargs)
+
+    axes[1].axhline(0, color="grey", lw=1, alpha=0.4)
+    axes[1].set_title("Arousal distribution by Overall Experience", fontsize=16)
+    axes[1].set_ylabel("Arousal")
+
+    for ax in axes:
+        ax.tick_params(axis='both', labelsize=12)
+
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_metric_correlations(
+        df: pd.DataFrame,
+        cols_to_plot: List[str],
+        output_dir: Union[str, Path],
+        figsize: tuple = (16, 13)
+):
+    valid_cols = [c for c in cols_to_plot if c in df.columns]
+    clip_df = df[valid_cols].copy()
+
+    clean_cols = [c.replace('_', ' ').replace('mean distance', '').title().strip() for c in valid_cols]
+    clip_df.columns = clean_cols
+
+    corr = clip_df.corr(numeric_only=True)
+
+    plt.figure(figsize=figsize)
+    mask = np.triu(np.ones_like(corr, dtype=bool))
+    ax = sns.heatmap(
+        corr,
+        mask=mask,
+        annot=True,
+        fmt=".2f",
+        cmap="YlGnBu",
+        vmin=-1,
+        vmax=1,
+        center=0,
+        square=True,
+        cbar_kws={"shrink": 1.0, "ticks": [-1, -0.5, 0, 0.5, 1]}
+    )
+
+    plt.title("Correlation between Clip-Level Metrics", fontsize=15, pad=20)
+    plt.xticks(rotation=90, ha="right")
+
+    y_labels = ax.get_yticklabels()
+    if len(y_labels):
+        y_labels[0].set_visible(False)
+
+    x_labels = ax.get_xticklabels()
+    if len(x_labels):
+        x_labels[-1].set_visible(False)
+
+    cbar = ax.collections[0].colorbar
+    cbar.ax.tick_params(labelsize=10)
+
+    output_path = Path(output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+
+
+def plot_diffusion_vs_polarization_map(
+    video_metrics: pd.DataFrame,
+    save_path: Optional[Path] = None,
+    x_col: str = "dispersion_mean_distance",
+    y_col: str = "anisotropy_index",
+    figsize=(10, 6),
+    cmap: str = "YlGnBu",
+    single_color_pos: float = 0.65,
+    marker_size: int = 140,
+    edgecolor: str = "white",
+    edge_lw: float = 1.0,
+    show_labels: bool = True,
+    label_fontsize: int = 9,
+):
+    """
+    Diffusion vs Polarization map (RQ2), simplified:
+
+    - x-axis: disagreement magnitude (mean distance to centroid)
+    - y-axis: directional structure (anisotropy index)
+    - single color for all points (sampled from cmap)
+    - circles only
+    - no OE legend, no GMM encoding, no reference lines
+    """
+
+    d = video_metrics.copy()
+    d = d.dropna(subset=[c.VIDEO_ID_COL, x_col, y_col]).copy()
+
+    # choose one color from the same palette
+    cm = plt.get_cmap(cmap)
+    point_color = cm(float(np.clip(single_color_pos, 0.0, 1.0)))
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for _, r in d.iterrows():
+        x = float(r[x_col])
+        y = float(r[y_col])
+        vid = str(int(r[c.VIDEO_ID_COL]))
+
+        ax.scatter(
+            x, y,
+            s=marker_size,
+            marker="o",
+            color=point_color,
+            edgecolor=edgecolor,
+            linewidth=edge_lw,
+            zorder=3
+        )
+        if show_labels:
+            ax.text(x, y, vid, fontsize=label_fontsize, ha="center", va="center", zorder=4)
+
+    ax.set_xlabel("Disagreement magnitude (mean distance to centroid)", fontsize=12)
+
+    if y_col == "anisotropy_index":
+        ax.set_ylabel("Directional structure (anisotropy index)", fontsize=12)
+        ax.set_ylim(0, 1.02)
+    else:
+        ax.set_ylabel(y_col.replace("_", " "), fontsize=12)
+
+    ax.set_title("Disagreement magnitude vs. directional structure (RQ2)", fontsize=14)
+    ax.grid(True, alpha=0.25, zorder=0)
+
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
 
 
 def plot_affect_grid(
@@ -103,6 +611,595 @@ def plot_affect_grid(
             fig.tight_layout()
             plt.show()
 
+"""
+def plot_video_affect_means_with_vectors(
+    video_metrics,
+    save_path: Optional[Path] = None,
+    oe_col: str = "oe_mean",
+    cmap: str = "YlGnBu",
+    arrow_scale: float = 0.35,
+    marker_size: float = 100,
+):
+    req = ["video_id", "valence_mean", "arousal_mean",
+           "valence_variance", "arousal_variance", "valence_arousal_covariance",
+           oe_col]
+    d = video_metrics.dropna(subset=req).copy()
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # ------------------------------------------------------------------
+    # DISCRETE COLORS BY OE CATEGORY
+    # ------------------------------------------------------------------
+    k = len(c.OE_ORDER)
+    cm = plt.get_cmap(cmap)
+    palette = cm(np.linspace(0.15, 0.9, k))
+    oe_to_color = {lab: palette[i] for i, lab in enumerate(c.OE_ORDER)}
+    d["_oe_cat"] = d["oe_mode"]
+
+    # ------------------------------------------------------------------
+    # PLOT POINTS + VECTORS
+    # Vector length = anisotropy of covariance (directionality of disagreement)
+    # ------------------------------------------------------------------
+    for _, row in d.reset_index(drop=True).iterrows():
+        x = float(row["valence_mean"])
+        y = float(row["arousal_mean"])
+        cat = row["_oe_cat"]
+        color = oe_to_color[cat]
+
+        cov = np.array([
+            [float(row["valence_variance"]), float(row["valence_arousal_covariance"])],
+            [float(row["valence_arousal_covariance"]), float(row["arousal_variance"])]
+        ])
+
+        # principal axis
+        vals, vecs = np.linalg.eigh(cov)
+        order = np.argsort(vals)[::-1]
+        vals = vals[order]
+        vecs = vecs[:, order]
+
+        v = vecs[:, 0]
+        lambda1 = float(max(vals[0], 0.0))
+        lambda2 = float(max(vals[1], 0.0))
+
+        # anisotropy in [0,1): 0 = round cloud, 1 = highly elongated/polarized
+        anisotropy = (lambda1 - lambda2) / (lambda1 + lambda2 + 1e-9)
+        anisotropy = float(np.clip(anisotropy, 0.0, 1.0))
+
+        dx = float(v[0] * anisotropy * arrow_scale)
+        dy = float(v[1] * anisotropy * arrow_scale)
+
+        ax.scatter(
+            x, y,
+            s=marker_size,
+            color=color,
+            edgecolor="white",
+            linewidth=0.9,
+            zorder=3
+        )
+
+        ax.plot([x - dx, x + dx], [y - dy, y + dy], color=color, lw=2.0, alpha=0.9, zorder=2)
+        ax.text(x, y, str(int(row["video_id"])), fontsize=10, ha="center", va="center", zorder=4)
+
+    # ------------------------------------------------------------------
+    # AFFECT GRID BACKDROP (10×10)
+    # ------------------------------------------------------------------
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Valence [-1, 1]", fontsize=14)
+    ax.set_ylabel("Arousal [-1, 1]", fontsize=14)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    step = 0.2
+    grid_vals = np.arange(-1, 1 + 1e-9, step)
+    for gv in grid_vals:
+        ax.axhline(gv, color="lightgrey", lw=0.8, zorder=0)
+        ax.axvline(gv, color="lightgrey", lw=0.8, zorder=0)
+
+    ax.axhline(0, color="darkgrey", lw=1.2, zorder=1)
+    ax.axvline(0, color="darkgrey", lw=1.2, zorder=1)
+    ax.set_title("Cycling Scenarios in Valence–Arousal Space", fontsize=14, fontweight="bold", pad=14)
+
+    # ------------------------------------------------------------------
+    # DISCRETE LEGEND (OE categories)
+    # ------------------------------------------------------------------
+    legend_handles = [
+        Line2D([0], [0], marker='o', linestyle='',
+               markerfacecolor=oe_to_color[lab],
+               markeredgecolor='white', markeredgewidth=0.9,
+               markersize=10, label=lab)
+        for lab in c.OE_ORDER
+    ]
+
+    line_handle = Line2D([0], [0], color="grey", lw=2.0, label="Main variance direction")
+
+    legend_handles.append(line_handle)
+    ax.legend(
+        handles=legend_handles,
+        title="Overall Experience (OE)",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        ncol=1,
+        frameon=True,
+        fontsize=14,
+        title_fontsize=14
+    )
+
+    plt.tight_layout(rect=[0, 0, 0.82, 1])
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+"""
+
+def plot_video_affect_means_with_vectors(
+        video_metrics,
+        save_path: Optional[Path] = None,
+        oe_col: str = "oe_mean",
+        cmap: str = "YlGnBu",
+        arrow_scale: float = 0.35,
+        marker_size: float = 100,
+):
+    req = ["video_id", "valence_mean", "arousal_mean",
+           "valence_variance", "arousal_variance", "valence_arousal_covariance",
+           oe_col]
+    d = video_metrics.dropna(subset=req).copy()
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # ------------------------------------------------------------------
+    # DISCRETE COLORS BY OE CATEGORY
+    # ------------------------------------------------------------------
+    k = len(c.OE_ORDER)
+    cm = plt.get_cmap(cmap)
+    palette = cm(np.linspace(0.15, 0.9, k))
+    oe_to_color = {lab: palette[i] for i, lab in enumerate(c.OE_ORDER)}
+    d["_oe_cat"] = d["oe_mode"]
+
+    texts = []
+    all_x = []
+    all_y = []
+
+    # ------------------------------------------------------------------
+    # PLOT POINTS + VECTORS
+    # ------------------------------------------------------------------
+    for _, row in d.reset_index(drop=True).iterrows():
+        x = float(row["valence_mean"])
+        y = float(row["arousal_mean"])
+        cat = row["_oe_cat"]
+        color = oe_to_color[cat]
+
+        cov = np.array([
+            [float(row["valence_variance"]), float(row["valence_arousal_covariance"])],
+            [float(row["valence_arousal_covariance"]), float(row["arousal_variance"])]
+        ])
+
+        vals, vecs = np.linalg.eigh(cov)
+        order = np.argsort(vals)[::-1]
+        vals = vals[order]
+        vecs = vecs[:, order]
+
+        v = vecs[:, 0]
+        lambda1 = float(max(vals[0], 0.0))
+        lambda2 = float(max(vals[1], 0.0))
+
+        anisotropy = (lambda1 - lambda2) / (lambda1 + lambda2 + 1e-9)
+        anisotropy = float(np.clip(anisotropy, 0.0, 1.0))
+
+        dx = float(v[0] * anisotropy * arrow_scale)
+        dy = float(v[1] * anisotropy * arrow_scale)
+
+        ax.scatter(
+            x, y,
+            s=marker_size,
+            color=color,
+            edgecolor="white",
+            linewidth=0.9,
+            zorder=3
+        )
+
+        ax.plot([x - dx, x + dx], [y - dy, y + dy], color=color, lw=2.0, alpha=0.9, zorder=2)
+        t = ax.text(x, y, str(int(row["video_id"])), fontsize=10,
+                    ha="center", va="center", zorder=4, color="#333333")
+        texts.append(t)
+        all_x.append(x)
+        all_y.append(y)
+
+    # ------------------------------------------------------------------
+    # AFFECT GRID BACKDROP (10×10) & LIMITS
+    # ------------------------------------------------------------------
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Valence [-1, 1]", fontsize=14)
+    ax.set_ylabel("Arousal [-1, 1]", fontsize=14)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    step = 0.2
+    grid_vals = np.arange(-1, 1 + 1e-9, step)
+    for gv in grid_vals:
+        ax.axhline(gv, color="lightgrey", lw=0.8, zorder=0)
+        ax.axvline(gv, color="lightgrey", lw=0.8, zorder=0)
+
+    ax.axhline(0, color="darkgrey", lw=1.2, zorder=1)
+    ax.axvline(0, color="darkgrey", lw=1.2, zorder=1)
+    ax.set_title("Cycling Scenarios in Valence–Arousal Space", fontsize=14, fontweight="bold", pad=14)
+
+    # ------------------------------------------------------------------
+    # DISCRETE LEGEND
+    # ------------------------------------------------------------------
+    legend_handles = [
+        Line2D([0], [0], marker='o', linestyle='',
+               markerfacecolor=oe_to_color[lab],
+               markeredgecolor='white', markeredgewidth=0.9,
+               markersize=10, label=lab)
+        for lab in c.OE_ORDER
+    ]
+    line_handle = Line2D([0], [0], color="grey", lw=2.0, label="Main variance direction")
+    legend_handles.append(line_handle)
+
+    ax.legend(
+        handles=legend_handles,
+        title="Overall Experience (OE)",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        ncol=1,
+        frameon=True,
+        fontsize=14,
+        title_fontsize=14
+    )
+
+    # ------------------------------------------------------------------
+    # ADJUST TEXT (Aggressive Settings)
+    # ------------------------------------------------------------------
+    adjust_text(
+        texts,
+        x=all_x,
+        y=all_y,
+        arrowprops=dict(arrowstyle='-', color='gray', lw=1, alpha=0.5),
+        force_text=10,
+        force_points=20,
+        expand_points=(1.5, 1.5)
+    )
+
+    plt.tight_layout(rect=[0, 0, 0.82, 1])
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def _natural_key(x: Any) -> List[Any]:
+    """
+    Natural sort key: "vid2" < "vid10".
+    Falls back gracefully for non-strings.
+    """
+    s = "" if pd.isna(x) else str(x)
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def create_quadrant_distribution_plot(
+            long_df: pd.DataFrame,
+            video_id_column: str,
+            output_path: Optional[Path] = None,
+            figsize: Tuple[int, int] = (15, 8),
+            show_percent_labels: bool = True,
+            label_threshold_pct: float = 5.0
+) -> None:
+
+        sns.set_theme(style="whitegrid")
+        colors = sns.color_palette("YlGnBu", n_colors=len(c.AFFECTIVE_STATES))
+
+        df = long_df.copy()
+        pivot = pd.crosstab(df[video_id_column], df[c.AFFECT_STATE])
+        pivot = pivot.reindex(columns=c.AFFECTIVE_STATES, fill_value=0)
+
+        row_sums = pivot.sum(axis=1).replace(0, np.nan)
+        pivot_pct = (pivot.div(row_sums, axis=0) * 100).fillna(0)
+
+        # --------------------------------------------------
+        # Compute quadrant entropy (categorical ambiguity)
+        # --------------------------------------------------
+        eps = 1e-12
+        entropy = - (pivot_pct / 100.0) * np.log((pivot_pct / 100.0) + eps)
+        entropy = entropy.sum(axis=1)
+
+        # --------------------------------------------------
+        # Sort videos by entropy (low → high ambiguity)
+        # --------------------------------------------------
+        video_ids_sorted = entropy.sort_values(ascending=True).index.tolist()
+
+        pivot = pivot.reindex(index=video_ids_sorted, fill_value=0)
+        pivot_pct = pivot_pct.reindex(index=video_ids_sorted, fill_value=0)
+
+
+        fig, ax = plt.subplots(figsize=figsize)
+        n = len(video_ids_sorted)
+        x = np.arange(n)
+        bottom = np.zeros(n)
+
+        for idx, state in enumerate(c.AFFECTIVE_STATES):
+            values = pivot_pct[state].to_numpy()
+
+            ax.bar(
+                x,
+                values,
+                bottom=bottom,
+                label=state,
+                color=colors[idx]
+            )
+            ax.margins(x=0.01)
+
+            if show_percent_labels:
+                for j, (v, b) in enumerate(zip(values, bottom)):
+                    if v >= label_threshold_pct:
+                        ax.text(
+                            float(x[j]),
+                            float(b + v / 2),
+                            f"{v:.0f}",
+                            ha="center",
+                            va="center",
+                            fontsize=14,
+                            color="white"
+                        )
+
+            bottom += values
+
+        ax.set_xlabel("Cycling Scenario ID", fontsize=20, labelpad=14)
+        ax.set_ylabel("Responses (%)", fontsize=20)
+        ax.set_title("Affective Quadrant Distribution per Cycling Scenario", pad=16, fontsize=24, fontweight="bold")
+        ax.tick_params(axis='y', labelsize=18)
+        ax.set_xticks(x)
+        ax.set_xticklabels(video_ids_sorted, ha="center", fontsize=18)
+
+        ax.legend(
+            title="Affective States",
+            ncol=len(c.AFFECTIVE_STATES),
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.5),
+            frameon=True,
+            fontsize=18,
+            title_fontsize=18
+        )
+        fig.tight_layout()
+
+        if output_path:
+            fig.savefig(output_path, dpi=150, bbox_inches="tight")
+
+        plt.close(fig)
+
+
+def plot_disagreement_geometry_vs_cues(
+        video_level_scores: pd.DataFrame,
+        save_path: Optional[Path] = None,
+        video_col: str = "video_id",
+        experience_col: str = "valence_mean",
+        cue_col: str = "pf_nf_label_entropy",
+        figsize: Tuple[int, int] = (18, 6),
+        cmap: str = "YlGnBu",
+        annotate: bool = True,
+        marker_size: int = 110,
+        edgecolor: str = "white",
+        edge_lw: float = 0.9,
+) -> None:
+    """
+    RQ2 figure: Linking disagreement geometry to perceived environmental cues.
+    """
+
+    panels = [
+        ("dispersion_mean_distance",
+         "Dispersion (mean distance to centroid)",
+         "Disagreement magnitude vs cue diversity"),
+
+        ("anisotropy_index",
+         "Anisotropy index (directional structure)",
+         "Directional structure vs cue diversity"),
+
+        ("affect_state_entropy",
+         "Affect-state entropy (quadrant ambiguity)",
+         "Categorical ambiguity vs cue diversity"),
+    ]
+
+    # --- minimal cleaning
+    needed = [video_col, cue_col, experience_col] + [p[0] for p in panels]
+    df = video_level_scores.copy()
+    df = df[needed].dropna().copy()
+
+    # --- color normalization: center at 0 for valence
+    vmin = float(np.nanmin(df[experience_col]))
+    vmax = float(np.nanmax(df[experience_col]))
+    vmax_abs = max(abs(vmin), abs(vmax))
+    norm = plt.Normalize(vmin=-vmax_abs, vmax=vmax_abs)
+    cm = plt.get_cmap(cmap)
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize, sharex=True)
+
+    # We need to store the mappable (sc) to create the colorbar later
+    sc = None
+
+    for ax, (y_col, y_label, title) in zip(axes, panels):
+        sc = ax.scatter(
+            df[cue_col],
+            df[y_col],
+            s=marker_size,
+            c=df[experience_col],
+            cmap=cm,
+            norm=norm,
+            edgecolor=edgecolor,
+            linewidth=edge_lw,
+            alpha=0.95,
+            zorder=3,
+        )
+
+        if annotate:
+            for _, r in df.iterrows():
+                ax.annotate(
+                    str(int(r[video_col])),
+                    (float(r[cue_col]), float(r[y_col])),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=11,
+                    alpha=0.85,
+                    zorder=4,
+                )
+
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.set_xlabel("Cue entropy (PF + NF)", fontsize=12)
+        ax.set_ylabel(y_label, fontsize=12)
+        ax.grid(True, alpha=0.25, zorder=0)
+
+
+    fig.tight_layout(rect=[0, 0, 0.90, 1])
+    cax = fig.add_axes([0.91, 0.15, 0.015, 0.7])
+    cbar = fig.colorbar(sc, cax=cax)
+    cbar.set_label("Mean valence (scenario centroid)", fontsize=12)
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_conditional_displacement_vectors(
+    driver_df,
+    save_path,
+    limit: float = 0.35,
+    cmap_name: str = "YlGnBu",
+    grid_step: float = 0.1,
+    panel_titles=("Positive cues", "Negative cues"),
+    suptitle="Cue-conditioned displacement vectors",
+    legend_title="Cue key",
+):
+
+    sns.set_style("white")
+    cue_names = sorted({str(x).split(": ")[1] for x in driver_df["factor"]})
+    cue_key = {name: (chr(97 + i) if i < 26 else f"z{i}") for i, name in enumerate(cue_names)}
+    cmap = plt.get_cmap(cmap_name)
+    norm = mcolors.Normalize(vmin=0, vmax=float(driver_df["magnitude"].max()))
+    grid_lines = np.arange(-1.0, 1.0 + 1e-9, grid_step)
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8.5), sharex=True, sharey=True)
+
+    def _draw_backdrop(ax):
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(-limit, limit)
+        ax.set_ylim(-limit, limit)
+
+        for gl in grid_lines:
+            ax.axhline(gl, color="#f0f0f0", lw=0.6, zorder=0)
+            ax.axvline(gl, color="#f0f0f0", lw=0.6, zorder=0)
+
+        # origin lines (0,0 = scenario centroid in displacement space)
+        ax.axhline(0, color="#888888", lw=1.5, alpha=0.5, zorder=1)
+        ax.axvline(0, color="#888888", lw=1.5, alpha=0.5, zorder=1)
+
+    def _draw_vectors(ax, subset):
+        for _, row in subset.iterrows():
+            color = cmap(norm(row["magnitude"]))
+            cue_name = str(row["factor"]).split(": ")[1]
+            letter = cue_key[cue_name]
+
+            dx = float(row["valence_pull"])
+            dy = float(row["arousal_pull"])
+
+            ax.arrow(
+                0, 0, dx, dy,
+                head_width=limit * 0.05,
+                head_length=limit * 0.05,
+                fc=color, ec=color,
+                alpha=0.9,
+                length_includes_head=True,
+                lw=3.0,
+                zorder=2,
+            )
+
+            ax.text(
+                dx * 1.12, dy * 1.12, letter,
+                fontsize=14,
+                fontweight="bold",
+                color="black",
+                ha="center",
+                va="center",
+            )
+
+    # ---- panels
+    for i, cue_type in enumerate(["Positive", "Negative"]):
+        ax = axes[i]
+        subset = driver_df[driver_df["type"] == cue_type].sort_values("magnitude")
+
+        _draw_backdrop(ax)
+        _draw_vectors(ax, subset)
+
+        ax.set_title(panel_titles[i], fontsize=20, pad=15)
+        ax.set_xlabel(r"$\Delta$ Valence", fontsize=18)
+        if i == 0:
+            ax.set_ylabel(r"$\Delta$ Arousal", fontsize=18)
+
+    plt.tight_layout(rect=[0, 0.1, 0.92, 0.95])
+    pos = axes[1].get_position()
+    cbar_ax = fig.add_axes([0.94, pos.y0, 0.015, pos.height])
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    fig.colorbar(sm, cax=cbar_ax).set_label(
+        r"Centroid displacement magnitude",
+        fontsize=18,
+        labelpad=15,
+    )
+
+    # ---- legend (same look)
+    key_elements = [
+        plt.Line2D([0], [0], color="w",
+                   label=f"{letter}: {label}")
+        for label, letter in cue_key.items()
+    ]
+    fig.legend(
+        handles=key_elements,
+        loc="lower center",
+        ncol=3,
+        bbox_to_anchor=(0.5, -0.17),
+        fontsize=18,
+        title=legend_title,
+        title_fontsize=20,
+        frameon=True,
+    )
+
+    plt.suptitle(suptitle, fontsize=24, y=1.02, fontweight="bold")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -------------------------------------------------------------
+# Demographic analysis functions
+# -------------------------------------------------------------
 
 def plot_oe_distribution_by_fam(
         df: pd.DataFrame,
@@ -151,78 +1248,348 @@ def plot_oe_distribution_by_fam(
         fig.tight_layout()
         plt.show()
 
+def icc2_1_anova(df: pd.DataFrame, targets: str, raters: str, scores: str) -> float:
+    d = df[[targets, raters, scores]].dropna()
+    if d[targets].nunique() < 2 or d[raters].nunique() < 2:
+        return np.nan
 
-def generate_demographic_summary(
+    m = ols(f"{scores} ~ C({targets}) + C({raters})", data=d).fit()
+    aov = sm.stats.anova_lm(m, typ=2)
+
+    MS_t = aov.loc[f"C({targets})", "sum_sq"] / aov.loc[f"C({targets})", "df"]
+    MS_r = aov.loc[f"C({raters})",  "sum_sq"] / aov.loc[f"C({raters})",  "df"]
+    MS_e = aov.loc["Residual",      "sum_sq"] / aov.loc["Residual",      "df"]
+
+    n = d[targets].nunique()
+    k = d[raters].nunique()
+
+    denom = MS_t + (k - 1) * MS_e + (k / n) * (MS_r - MS_e)
+    return float((MS_t - MS_e) / denom) if denom > 0 else np.nan
+
+
+def generate_demographic_table(
         df: pd.DataFrame,
-        columns: List[str],
-        orders: Optional[Dict[str, List[str]]] = None,
-        save_path: Optional[Path] = None
+        demo_cols: List[str] = c.DEMOGRAPHIC_COLUMNS,
+        pid_col: str = c.PARTICIPANT_ID,
+        video_col: str = c.VIDEO_ID_COL,
+        valence_col: str = c.VALENCE,
+        arousal_col: str = c.AROUSAL,
+        output_path: Optional[Path] = None,
+        compute_icc: bool = True,
+        min_n_participants: int = 25,
 ) -> pd.DataFrame:
-    """
-    Generate a demographic summary table and corresponding bar plots for specified columns.
-    :param df: DataFrame containing the demographic data.
-    :param columns: List of column names to include in the summary and plots.
-    :param orders: Optional dictionary specifying the order of categories for certain columns.
-    :param save_path: Optional file path to save the figure.
-    :return: DataFrame summarizing counts and percentages for each category in the specified columns.
-    """
+    d0 = df.copy()
 
-    fig, axes = plt.subplots(2, 3, figsize=(13.8, 8), sharex=False)
-    axes = axes.ravel()
-    k = min(6, len(columns))
-    summary_rows = []
+    # --- ICC Function ---
+    def _maybe_icc(g: pd.DataFrame, score_col: str) -> float:
+        if not compute_icc: return np.nan
+        if g[pid_col].nunique() < min_n_participants: return np.nan
+        if g[video_col].nunique() < 2: return np.nan
+        return icc2_1_anova(g, targets=video_col, raters=pid_col, scores=score_col)
 
-    for i, col in enumerate(columns[:k]):
-        ax = axes[i]
+    def _posthoc_pairwise(data: pd.DataFrame, group_col: str, value_col: str, pid_col: str) -> pd.DataFrame:
+        """
+        For significant categories, perform pairwise comparisons between levels.
+        """
+        # Get participant means for each level
+        level_means = {}
+        for level, g in data.groupby(group_col):
+            level_means[level] = g.groupby(pid_col)[value_col].mean().dropna()
 
-        unique_participants_df = df.drop_duplicates(subset=[c.PARTICIPANT_ID])
-        s = unique_participants_df[col].dropna().astype(str)
+        levels = list(level_means.keys())
+        comparisons = []
 
-        if orders and col in orders:
-            cat_order = [x for x in orders[col] if x in s.unique()]
-            s = s.astype(pd.CategoricalDtype(cat_order, ordered=True))
-            vc = s.value_counts(sort=False)
+        for i, level1 in enumerate(levels):
+            for level2 in levels[i + 1:]:
+                stat, p = ttest_ind(level_means[level1], level_means[level2], equal_var=False)
+                mean_diff = level_means[level1].mean() - level_means[level2].mean()
+                comparisons.append({
+                    'Level_1': level1,
+                    'Level_2': level2,
+                    'Mean_diff': mean_diff,
+                    'p_value': p
+                })
+
+        return pd.DataFrame(comparisons)
+
+    # ---  Significance Test Helper ---
+    def _calc_significance_corrected(data: pd.DataFrame, group_col: str, value_col: str) -> float:
+
+        # calculate the MEAN rating per PARTICIPANT
+        groups = [
+            g.groupby(pid_col)[value_col].mean().dropna()
+            for _, g in data.groupby(group_col)
+        ]
+
+        # Filter out groups with insufficient people
+        groups = [g for g in groups if len(g) > 1]
+
+        if len(groups) < 2:
+            return np.nan
+        elif len(groups) == 2:
+            # Welch's t-test on PARTICIPANT MEANS
+            stat, p = stats.ttest_ind(groups[0], groups[1], equal_var=False)
+            return p
         else:
-            vc = s.value_counts()
+            # One-way ANOVA on PARTICIPANT MEANS
+            stat, p = stats.f_oneway(*groups)
+            return p
 
-        summary_chunk = pd.DataFrame({
-            "variable": col,
-            "level": vc.index,
-            "counts": vc.values,
-            "pct": (vc / vc.sum() * 100).round(1).values
+    def _fmt_p(p):
+        if pd.isna(p): return ""
+        if p < 0.001: return "***"
+        if p < 0.01: return "**"
+        if p < 0.05: return "*"
+        return ""
+
+    rows = []
+
+    print("\n" + "=" * 60)
+    print("STATISTICAL SIGNIFICANCE TESTS")
+    print("=" * 60)
+
+    for col in demo_cols:
+        d = d0[d0[col].notna()].copy()
+        total_n = d[pid_col].nunique()
+
+        p_val_valence = _calc_significance_corrected(d, col, valence_col)
+        p_val_arousal = _calc_significance_corrected(d, col, arousal_col)
+
+        print(f"\n{col}:")
+        if pd.notna(p_val_valence):
+            print(f"  Valence: p = {p_val_valence:.4f} {_fmt_p(p_val_valence)}")
+            # If significant, do post-hoc
+            if p_val_valence < 0.05:
+                posthoc = _posthoc_pairwise(d, col, valence_col, pid_col)
+                print("    Post-hoc pairwise comparisons:")
+                for _, row in posthoc.iterrows():
+                    print(
+                        f"{row['Level_1']} vs {row['Level_2']}: p = {row['p_value']:.4f}, diff = {row['Mean_diff']:.3f}")
+
+        if pd.notna(p_val_arousal):
+            print(f"  Arousal: p = {p_val_arousal:.4f} {_fmt_p(p_val_arousal)}")
+            # If significant, do post-hoc
+            if p_val_arousal < 0.05:
+                posthoc = _posthoc_pairwise(d, col, arousal_col, pid_col)
+                print("    Post-hoc pairwise comparisons:")
+                for _, row in posthoc.iterrows():
+                    print(
+                        f"{row['Level_1']} vs {row['Level_2']}: p = {row['p_value']:.4f}, diff = {row['Mean_diff']:.3f}")
+        else:
+            print(f"  Arousal: p = N/A (insufficient groups)")
+
+        rows.append({
+            "category": col,
+            "level": "All",
+            "counts": total_n,
+            "%": 100.0,
+            "valence (mean)": round(d[valence_col].mean(), 2),
+            "valence (sd)": round(d[valence_col].std(), 2),
+            "arousal (mean)": round(d[arousal_col].mean(), 2),
+            "arousal (sd)": round(d[arousal_col].std(), 2),
+
+            "ICC2_1_valence": round(_maybe_icc(d, valence_col), 3),
+            "ICC2_1_arousal": round(_maybe_icc(d, arousal_col), 3),
+            "Sig_Valence": _fmt_p(p_val_valence),
+            "Sig_Arousal": _fmt_p(p_val_arousal)
         })
-        summary_rows.append(summary_chunk)
 
-        plot_data = summary_chunk[['level', 'pct']]
-        sns.barplot(data=plot_data, x="pct", y="level", hue="level",
-                    palette=sns.color_palette("viridis", n_colors=len(plot_data)),
-                    dodge=False, legend=False, ax=ax, orient="h")
+        for level, g in d.groupby(col):
+            n = g[pid_col].nunique()
+            rows.append({
+                "category": col,
+                "level": str(level),
+                "counts": n,
+                "%": round(n / total_n * 100, 1) if total_n else np.nan,
+                "valence (mean)": round(g[valence_col].mean(), 2),
+                "valence (sd)": round(g[valence_col].std(), 2),
+                "arousal (mean)": round(g[arousal_col].mean(), 2),
+                "arousal (sd)": round(g[arousal_col].std(), 2),
+                "ICC2_1_valence": round(_maybe_icc(g, valence_col), 3),
+                "ICC2_1_arousal": round(_maybe_icc(g, arousal_col), 3),
+                "Sig_Valence": "",
+                "Sig_Arousal": ""
+            })
 
-        ax.set(title=col.replace('_', ' ').title(), xlabel="Percent of Participants", ylabel="")
-        ax.set_xlim(0, 100)
-        ax.grid(axis="x", alpha=.2)
-        for sp in ax.spines.values(): sp.set_visible(False)
-        for y, v in enumerate(plot_data.pct):
-            ax.text(min(v, 98), y, f"{v:.1f}%", va="center",
-                    ha=("right" if v > 15 else "left"),
-                    color=("white" if v > 15 else "black"), fontsize=9)
+    print("\n" + "=" * 60)
+    print()
 
-    for j in range(k, 6):
-        axes[j].axis("off")
+    results = pd.DataFrame(rows)
+
+    if output_path:
+        results.to_csv(output_path, index=False)
+
+    return results
+
+
+def plot_subgroup_metrics_bootstrap(
+        files,
+        subgroup_cols,
+        metrics,
+        metric_labels=None,
+        overall_path=None,
+        n_boot=1000,
+        seed=42,
+        ci=(2.5, 97.5),
+        min_videos=5,
+        figsize=(14, 8),
+        save_path=None,
+):
+    rng = np.random.default_rng(seed)
+
+    if metric_labels is None:
+        metric_labels = {m: m for m in metrics}
+
+    # ---------------------------
+    # 1. Load Overall Reference Values
+    # ---------------------------
+    overall = {}
+    if overall_path is not None:
+        odf = pd.read_csv(Path(overall_path))
+        for m in metrics:
+            overall[m] = float(np.nanmean(odf[m].to_numpy(float))) if m in odf.columns else np.nan
+
+    # ---------------------------
+    # Helper: Bootstrap CI
+    # ---------------------------
+    def boot_mean_ci(x):
+        x = np.asarray(x, dtype=float)
+        x = x[np.isfinite(x)]
+        if x.size < min_videos:
+            return np.nan, np.nan, np.nan
+        mean = float(x.mean())
+        boots = rng.choice(x, size=(n_boot, x.size), replace=True).mean(axis=1)
+        lo, hi = np.percentile(boots, ci)
+        return mean, float(lo), float(hi)
+
+    # ---------------------------
+    # 2. Process Data
+    # ---------------------------
+    rows = []
+    for sg_name, path in files.items():
+        df = pd.read_csv(Path(path))
+        sg_col = subgroup_cols[sg_name]
+
+        subgroups = {lvl: d for lvl, d in df.dropna(subset=[sg_col]).groupby(sg_col)}
+        for level, sub in subgroups.items():
+            row = {"group": sg_name, "label": str(level), "level_name": level}
+            for m in metrics:
+                if m not in sub.columns:
+                    row[f"{m}_mean"] = np.nan
+                    row[f"{m}_lo"] = np.nan
+                    row[f"{m}_hi"] = np.nan
+                else:
+                    mean, lo, hi = boot_mean_ci(sub[m].to_numpy(float))
+                    row[f"{m}_mean"] = mean
+                    row[f"{m}_lo"] = lo
+                    row[f"{m}_hi"] = hi
+            rows.append(row)
+
+    plot_df = pd.DataFrame(rows)
+    if plot_df.empty:
+        raise ValueError("No data to plot.")
+
+    # ---------------------------
+    # 3. Plotting Setup
+    # ---------------------------
+    group_order = list(files.keys())
+    plot_df["group_order"] = pd.Categorical(plot_df["group"], categories=group_order, ordered=True)
+    plot_df = plot_df.sort_values(["group_order", "label"], kind="stable").reset_index(drop=True)
+
+    labels = plot_df["label"].tolist()
+    y = np.arange(len(labels))[::-1]
+
+    cmap = plt.get_cmap("YlGnBu")
+    tones = np.linspace(0.25, 0.85, len(group_order))
+    group_color = {g: cmap(t) for g, t in zip(group_order, tones)}
+    row_colors = plot_df["group"].map(group_color).tolist()
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=figsize, sharey=True, constrained_layout=True)
+    if len(metrics) == 1: axes = [axes]
+
+    # ---------------------------
+    # 4. Plot Metrics
+    # ---------------------------
+    for ax, m in zip(axes, metrics):
+        overall_val = overall.get(m, np.nan)
+
+        # --- INITIALIZE MIN/MAX TRACKING ---
+        data_min = overall_val if np.isfinite(overall_val) else np.inf
+        data_max = overall_val if np.isfinite(overall_val) else -np.inf
+
+        # Draw Overall Mean Line
+        if np.isfinite(overall_val):
+            ax.axvline(overall_val, color="0.55", lw=1.4, ls=(0, (4, 3)), alpha=0.65, zorder=1)
+
+        for i in range(len(plot_df)):
+            mean = plot_df.loc[i, f"{m}_mean"]
+            lo = plot_df.loc[i, f"{m}_lo"]
+            hi = plot_df.loc[i, f"{m}_hi"]
+
+            if not (np.isfinite(mean) and np.isfinite(lo) and np.isfinite(hi)):
+                continue
+
+            # Update min/max tracking based on data
+            data_min = min(data_min, lo)
+            data_max = max(data_max, hi)
+
+            # Plot error bar
+            ax.errorbar(mean, y[i], xerr=[[mean - lo], [hi - mean]], fmt="o",
+                        color=row_colors[i], elinewidth=2.0, markersize=7, capsize=0, zorder=3)
+
+            # Significance check
+            if np.isfinite(overall_val) and not (lo <= overall_val <= hi):
+                offset = 0.01 * (hi - lo) if (hi - lo) > 0 else 0.01
+                ax.text(hi + offset, y[i], "*", fontsize=20,
+                        color="black", fontweight='bold', va='center', ha='left')
+
+        # --- SET AXIS LIMITS AFTER COLLECTING ALL DATA POINTS ---
+        if "polarization" in m.lower():
+            # Fix PI to start at 0
+            ax.set_xlim(0, data_max * 1.2)
+        elif np.isfinite(overall_val) and np.isfinite(data_min) and np.isfinite(data_max):
+            # Symmetric centering
+            dist_left = overall_val - data_min
+            dist_right = data_max - overall_val
+            max_dist = max(dist_left, dist_right)
+            pad = max_dist * 0.15
+            limit_dist = max_dist + pad
+            ax.set_xlim(overall_val - limit_dist, overall_val + limit_dist)
+
+        ax.grid(True, axis="x", alpha=0.18)
+        ax.set_title(metric_labels.get(m, m), fontsize=18, weight="bold")
+        ax.set_xlabel("Mean (95% CI)", fontsize=16)
+        ax.tick_params(axis="x", labelsize=14)
+
+    axes[0].set_yticks(y)
+    axes[0].set_yticklabels(labels, fontsize=14)
+
+    # ---------------------------
+    # 5. Legend
+    # ---------------------------
+    legend_handles = [Line2D([0], [0], color=group_color[g], lw=4, label=g) for g in group_order]
+    legend_handles.append(Line2D([0], [0], marker='*', color='w', markerfacecolor='black', markersize=15,
+                                 label='Signif. diff. from mean'))
+
+    fig.legend(
+        handles=legend_handles,
+        loc='upper center',
+        bbox_to_anchor=(0.5, -0.03),
+        ncol=4,
+        frameon=False,
+        fontsize=14,
+        title="Observer Characteristics",
+        title_fontsize=16,
+    )
 
     if save_path:
-        plt.tight_layout()
-        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
     else:
-        plt.tight_layout()
         plt.show()
-    plt.close(fig)
-
-    final_summary_table = pd.concat(summary_rows, ignore_index=True)
-    return final_summary_table
-
 
 # --- Plotting functions for video clustering and selection ---
+
 
 def plot_target_comparisons(
         video_df: pd.DataFrame,
@@ -556,17 +1923,10 @@ def plot_ranking_by_nb_pos(
 def plot_video_rating_heatmap(
         df: pd.DataFrame,
         video_id: str,
-        col_prefix: str = '_AG',
+        col_prefix: str = 'AG',
         plot: bool = False
 ) -> Tuple[float, float, float]:
-    """
-    Plot a heatmap of video ratings and calculate the normalized distance from the center.
-    :param df:
-    :param video_id:
-    :param col_prefix:
-    :param plot:
-    :return:
-    """
+
     ratings = df[f'{video_id}{col_prefix}'].values.astype(int) - 1
     heatmap = np.zeros((10, 10), int)
     rows, cols = divmod(ratings, 10)
