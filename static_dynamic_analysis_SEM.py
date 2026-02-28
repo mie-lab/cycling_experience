@@ -864,7 +864,7 @@ def main():
     # ============================================================
     # 1. PARTICIPANT FILTERING
     # ============================================================
-    df_results = utils.processing_utils.filter_aggregate_results(
+    df_results = utils.processing_utils.filter_results(
         df_results,
         consent=False,
         duration=False,
