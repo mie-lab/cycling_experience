@@ -1248,23 +1248,28 @@ def plot_oe_distribution_by_fam(
         fig.tight_layout()
         plt.show()
 
+
 def icc2_1_anova(df: pd.DataFrame, targets: str, raters: str, scores: str) -> float:
     d = df[[targets, raters, scores]].dropna()
-    if d[targets].nunique() < 2 or d[raters].nunique() < 2:
-        return np.nan
+    n = d[targets].nunique()  # Number of scenarios (targets)
+    k = d[raters].nunique()  # Number of participants (raters)
 
-    m = ols(f"{scores} ~ C({targets}) + C({raters})", data=d).fit()
-    aov = sm.stats.anova_lm(m, typ=2)
+    if n < 2 or k < 2: return np.nan
 
+    # Fit two-way ANOVA model
+    model = ols(f"{scores} ~ C({targets}) + C({raters})", data=d).fit()
+    aov = sm.stats.anova_lm(model, typ=2)
+
+    # Mean Squares
     MS_t = aov.loc[f"C({targets})", "sum_sq"] / aov.loc[f"C({targets})", "df"]
-    MS_r = aov.loc[f"C({raters})",  "sum_sq"] / aov.loc[f"C({raters})",  "df"]
-    MS_e = aov.loc["Residual",      "sum_sq"] / aov.loc["Residual",      "df"]
+    MS_r = aov.loc[f"C({raters})", "sum_sq"] / aov.loc[f"C({raters})", "df"]
+    MS_e = aov.loc["Residual", "sum_sq"] / aov.loc["Residual", "df"]
 
-    n = d[targets].nunique()
-    k = d[raters].nunique()
-
+    # ICC(2,1) formula: Two-way random effects, absolute agreement, single rater
+    num = MS_t - MS_e
     denom = MS_t + (k - 1) * MS_e + (k / n) * (MS_r - MS_e)
-    return float((MS_t - MS_e) / denom) if denom > 0 else np.nan
+
+    return float(num / denom) if denom > 0 else np.nan
 
 
 def generate_demographic_table(
@@ -1441,17 +1446,29 @@ def plot_subgroup_metrics_bootstrap(
         metric_labels = {m: m for m in metrics}
 
     # ---------------------------
-    # 1. Load Overall Reference Values
+    # Helper: Bootstrap CI & Significance
     # ---------------------------
-    overall = {}
-    if overall_path is not None:
-        odf = pd.read_csv(Path(overall_path))
-        for m in metrics:
-            overall[m] = float(np.nanmean(odf[m].to_numpy(float))) if m in odf.columns else np.nan
+    def boot_mean_ci_and_p(x, overall_mean):
+        x = np.asarray(x, dtype=float)
+        x = x[np.isfinite(x)]
+        if x.size < min_videos:
+            return np.nan, np.nan, np.nan, np.nan
 
-    # ---------------------------
-    # Helper: Bootstrap CI
-    # ---------------------------
+        mean = float(x.mean())
+        boots = rng.choice(x, size=(n_boot, x.size), replace=True).mean(axis=1)
+        lo, hi = np.percentile(boots, ci)
+
+        # Hypothesis Test: Is the subgroup mean significantly different from overall_mean?
+        # We shift the distribution to the null hypothesis (overall_mean)
+        if np.isfinite(overall_mean):
+            shifted_boots = boots - mean + overall_mean
+            diff = abs(mean - overall_mean)
+            p_val = np.mean(np.abs(shifted_boots - overall_mean) >= diff)
+        else:
+            p_val = np.nan
+
+        return mean, float(lo), float(hi), p_val
+
     def boot_mean_ci(x):
         x = np.asarray(x, dtype=float)
         x = x[np.isfinite(x)]
@@ -1463,26 +1480,45 @@ def plot_subgroup_metrics_bootstrap(
         return mean, float(lo), float(hi)
 
     # ---------------------------
-    # 2. Process Data
+    # 1. Load Overall Reference Values (mean + CI)
+    # ---------------------------
+    overall_ci = {}
+    if overall_path is not None:
+        odf = pd.read_csv(Path(overall_path))
+        for m in metrics:
+            if m in odf.columns:
+                overall_ci[m] = boot_mean_ci(odf[m].to_numpy(float))
+            else:
+                overall_ci[m] = (np.nan, np.nan, np.nan)
+    else:
+        for m in metrics:
+            overall_ci[m] = (np.nan, np.nan, np.nan)
+
+    # ---------------------------
+    # 2. Process Data (Integrating p-value calculation)
     # ---------------------------
     rows = []
     for sg_name, path in files.items():
         df = pd.read_csv(Path(path))
         sg_col = subgroup_cols[sg_name]
 
-        subgroups = {lvl: d for lvl, d in df.dropna(subset=[sg_col]).groupby(sg_col)}
-        for level, sub in subgroups.items():
+        df = df.dropna(subset=[sg_col]).copy()
+        if df.empty:
+            continue
+
+        for level, sub in df.groupby(sg_col):
             row = {"group": sg_name, "label": str(level), "level_name": level}
             for m in metrics:
                 if m not in sub.columns:
-                    row[f"{m}_mean"] = np.nan
-                    row[f"{m}_lo"] = np.nan
-                    row[f"{m}_hi"] = np.nan
+                    row[f"{m}_mean"] = row[f"{m}_lo"] = row[f"{m}_hi"] = row[f"{m}_p"] = np.nan
                 else:
-                    mean, lo, hi = boot_mean_ci(sub[m].to_numpy(float))
+                    # Get the reference mean for the hypothesis test
+                    ref_mean = overall_ci[m][0]
+                    mean, lo, hi, p = boot_mean_ci_and_p(sub[m].to_numpy(float), ref_mean)
                     row[f"{m}_mean"] = mean
                     row[f"{m}_lo"] = lo
                     row[f"{m}_hi"] = hi
+                    row[f"{m}_p"] = p
             rows.append(row)
 
     plot_df = pd.DataFrame(rows)
@@ -1505,56 +1541,69 @@ def plot_subgroup_metrics_bootstrap(
     row_colors = plot_df["group"].map(group_color).tolist()
 
     fig, axes = plt.subplots(1, len(metrics), figsize=figsize, sharey=True, constrained_layout=True)
-    if len(metrics) == 1: axes = [axes]
+    if len(metrics) == 1:
+        axes = [axes]
 
     # ---------------------------
     # 4. Plot Metrics
     # ---------------------------
     for ax, m in zip(axes, metrics):
-        overall_val = overall.get(m, np.nan)
+        data_min = np.inf
+        data_max = -np.inf
 
-        # --- INITIALIZE MIN/MAX TRACKING ---
-        data_min = overall_val if np.isfinite(overall_val) else np.inf
-        data_max = overall_val if np.isfinite(overall_val) else -np.inf
+        overall_mean, overall_lo, overall_hi = overall_ci.get(m, (np.nan, np.nan, np.nan))
 
-        # Draw Overall Mean Line
-        if np.isfinite(overall_val):
-            ax.axvline(overall_val, color="0.55", lw=1.4, ls=(0, (4, 3)), alpha=0.65, zorder=1)
+        if np.isfinite(overall_lo) and np.isfinite(overall_hi):
+            ax.axvspan(overall_lo, overall_hi, color="0.8", alpha=0.25, zorder=0)
+            ax.axvline(overall_lo, color="0.65", lw=1.2, ls=(0, (2, 2)), alpha=0.9, zorder=1)
+            ax.axvline(overall_hi, color="0.65", lw=1.2, ls=(0, (2, 2)), alpha=0.9, zorder=1)
+            data_min = min(data_min, overall_lo)
+            data_max = max(data_max, overall_hi)
+
+        if np.isfinite(overall_mean):
+            ax.axvline(overall_mean, color="0.55", lw=1.4, ls=(0, (4, 3)), alpha=0.8, zorder=2)
+            data_min = min(data_min, overall_mean)
+            data_max = max(data_max, overall_mean)
 
         for i in range(len(plot_df)):
             mean = plot_df.loc[i, f"{m}_mean"]
             lo = plot_df.loc[i, f"{m}_lo"]
             hi = plot_df.loc[i, f"{m}_hi"]
+            p_val = plot_df.loc[i, f"{m}_p"]
 
             if not (np.isfinite(mean) and np.isfinite(lo) and np.isfinite(hi)):
                 continue
 
-            # Update min/max tracking based on data
             data_min = min(data_min, lo)
             data_max = max(data_max, hi)
 
-            # Plot error bar
-            ax.errorbar(mean, y[i], xerr=[[mean - lo], [hi - mean]], fmt="o",
-                        color=row_colors[i], elinewidth=2.0, markersize=7, capsize=0, zorder=3)
+            ax.errorbar(
+                mean, y[i],
+                xerr=[[mean - lo], [hi - mean]],
+                fmt="o",
+                color=row_colors[i],
+                elinewidth=2.0,
+                markersize=7,
+                capsize=0,
+                zorder=3
+            )
 
-            # Significance check
-            if np.isfinite(overall_val) and not (lo <= overall_val <= hi):
-                offset = 0.01 * (hi - lo) if (hi - lo) > 0 else 0.01
-                ax.text(hi + offset, y[i], "*", fontsize=20,
-                        color="black", fontweight='bold', va='center', ha='left')
+            # SIGNIFICANCE ANNOTATION
+            if np.isfinite(p_val) and p_val < 0.05:
+                # Offset the asterisk slightly to the right of the upper CI bound
+                ax.text(hi + 0.01, y[i], "*", color="black", va="center", ha="left", fontweight="bold", fontsize=16)
 
-        # --- SET AXIS LIMITS AFTER COLLECTING ALL DATA POINTS ---
-        if "polarization" in m.lower():
-            # Fix PI to start at 0
-            ax.set_xlim(0, data_max * 1.2)
-        elif np.isfinite(overall_val) and np.isfinite(data_min) and np.isfinite(data_max):
-            # Symmetric centering
-            dist_left = overall_val - data_min
-            dist_right = data_max - overall_val
+        # Axis limits logic (preserved)
+        if np.isfinite(overall_mean) and data_min != np.inf:
+            dist_left = overall_mean - data_min
+            dist_right = data_max - overall_mean
             max_dist = max(dist_left, dist_right)
-            pad = max_dist * 0.15
+            pad = max_dist * 0.25 # Slightly increased padding for asterisks
             limit_dist = max_dist + pad
-            ax.set_xlim(overall_val - limit_dist, overall_val + limit_dist)
+            ax.set_xlim(overall_mean - limit_dist, overall_mean + limit_dist)
+        elif data_min != np.inf:
+            pad = (data_max - data_min) * 0.15
+            ax.set_xlim(data_min - pad, data_max + pad)
 
         ax.grid(True, axis="x", alpha=0.18)
         ax.set_title(metric_labels.get(m, m), fontsize=18, weight="bold")
@@ -1565,21 +1614,22 @@ def plot_subgroup_metrics_bootstrap(
     axes[0].set_yticklabels(labels, fontsize=14)
 
     # ---------------------------
-    # 5. Legend
+    # 5. Legend (preserved)
     # ---------------------------
     legend_handles = [Line2D([0], [0], color=group_color[g], lw=4, label=g) for g in group_order]
-    legend_handles.append(Line2D([0], [0], marker='*', color='w', markerfacecolor='black', markersize=15,
-                                 label='Signif. diff. from mean'))
+    legend_handles.append(Line2D([0], [0], color="0.55", lw=1.4, ls=(0, (4, 3)), label="Overall mean"))
+    legend_handles.append(Patch(facecolor="0.8", edgecolor="none", alpha=0.25, label="Overall 95% CI"))
+    legend_handles.append(Line2D([0], [0], color="black", marker='*', linestyle='None', markersize=5, label="p < 0.05 vs. Overall"))
 
     fig.legend(
         handles=legend_handles,
         loc='upper center',
         bbox_to_anchor=(0.5, -0.03),
-        ncol=4,
+        ncol=5,
         frameon=False,
-        fontsize=14,
+        fontsize=16,
         title="Observer Characteristics",
-        title_fontsize=16,
+        title_fontsize=18,
     )
 
     if save_path:
@@ -1588,7 +1638,29 @@ def plot_subgroup_metrics_bootstrap(
     else:
         plt.show()
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # --- Plotting functions for video clustering and selection ---
+
+
+
+
 
 
 def plot_target_comparisons(

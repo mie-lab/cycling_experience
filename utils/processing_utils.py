@@ -379,8 +379,8 @@ def calculate_video_level_scores(
         # -------------------------------------------------
         # per-dimension distribution summaries
         # -------------------------------------------------
-        valence_mean = round(float(np.mean(valence_values)), 2)
-        arousal_mean = round(float(np.mean(arousal_values)), 2)
+        valence_mean = float(np.mean(valence_values))
+        arousal_mean = float(np.mean(arousal_values))
 
         valence_sd = round(float(np.std(valence_values, ddof=1)), 2) if n_ratings > 1 else np.nan
         arousal_sd = round(float(np.std(arousal_values, ddof=1)), 2) if n_ratings > 1 else np.nan
@@ -393,7 +393,7 @@ def calculate_video_level_scores(
         # -------------------------------------------------
         dev = affect_points - np.array([valence_mean, arousal_mean])
         distances = np.linalg.norm(dev, axis=1)
-        dispersion_mean_distance = round(float(distances.mean()), 2)
+        dispersion_mean_distance = float(distances.mean())
 
         if n_ratings >= 2:
             # Pairwise Euclidean distances over all i<j (length n(n-1)/2)
@@ -410,13 +410,15 @@ def calculate_video_level_scores(
             pairwise_rms_distance = np.nan
 
         # A. Anisotropy (Structure of Disagreement)
-        pca = PCA(n_components=1)
-        pca.fit(affect_points)
-        # Scale: 0.5->1 (Original) becomes 0->1 (Scaled)
-        # 0 = Isotropic (Circular confusion), 1 = Anisotropic (Linear polarization)
-        raw_pca_ratio = pca.explained_variance_ratio_[0]
-        anisotropy_index = (raw_pca_ratio - 0.5) * 2.0
-        anisotropy_index = max(0.0, anisotropy_index)  # clip floating point errors
+        if n_ratings > 1:
+            cov_matrix = np.cov(affect_points.T)
+            # Use eigh because the covariance matrix is symmetric
+            eigenvalues = np.linalg.eigvalsh(cov_matrix)
+            l1, l2 = np.sort(eigenvalues)[::-1]
+            # AI ranges from 0 (isotropic/circle) to 1 (linear)
+            anisotropy_index = (l1 - l2) / (l1 + l2 + 1e-9)
+        else:
+            anisotropy_index = 0.0
 
         # -------------------------------------------------
         # 4. Polarization Index (Structural Bimodality)
@@ -445,11 +447,13 @@ def calculate_video_level_scores(
                 mu2 = gmm2.means_[1]
                 dist = np.linalg.norm(mu1 - mu2)
 
+                polarization_index = float(dist)
+
                 # 3. Robust Decision Logic - ONLY assign if thresholds pass
-                if delta_bic >= BIC_MARGIN and dist >= MIN_SEPARATION:
-                    polarization_index = float(dist)
-                else:
-                    polarization_index = 0.0
+                #if delta_bic >= BIC_MARGIN and dist >= MIN_SEPARATION:
+                #    polarization_index = float(dist)
+                #else:
+                #    polarization_index = 0.0
 
             except Exception as e:
                 log.warning(f"Video {video_id}: GMM fitting failed - {e}")
@@ -598,6 +602,22 @@ def calculate_video_level_scores_by_subgroup(
             continue
 
         video_scores = calculate_video_level_scores(df_sub)
+
+        video_scores = add_factor_counts_to_scores(
+            scores_df=video_scores,
+            survey_df=df_sub,
+            label_cols=c.LABEL_COLS,
+            video_col=c.VIDEO_ID_COL,
+            pf_col=c.PF,
+            nf_col=c.NF
+        )
+
+        video_scores, _ = pf_nf_disagreement_analysis(
+            video_level_scores=video_scores,
+            label_cols=c.LABEL_COLS,
+            out_csv_path=None  # IMPORTANT: don't overwrite global file
+        )
+
         video_scores[subgroup_col] = level
         video_scores["n_participants"] = n_participants
         results.append(video_scores)

@@ -67,8 +67,8 @@ def main():
        output_path=Path(output_dir / 'demographic_summary_aggregated.csv')
     )
 
-    #reliability_df = utils.processing_utils.compute_video_reliability(survey_results_df)
-    #log.info(f"\n--- Video Reliability (ICC) ---\n{reliability_df}\n")
+    reliability_df = utils.processing_utils.compute_video_reliability(survey_results_df)
+    log.info(f"\n--- Video Reliability (ICC) ---\n{reliability_df}\n")
 
     # =============================================================================
     # PHASE 3: EXPLORATORY ANALYSIS & VISUALIZATION (RQ1)
@@ -76,33 +76,33 @@ def main():
     log.info("Generating exploratory visualizations for RQ1...")
 
     # Plot affect grid for all videos combined
-    #utils.plotting_utils.plot_affect_grid_subplots(
-    #   survey_results_df,
-    #   ncols=5, nrows=6,
-    #   normalize="count",
-    #   robust_vmax_percentile=99,
-    #   save_path=output_dir / "affect_grid_all_videos.png",
-    #)
+    utils.plotting_utils.plot_affect_grid_subplots(
+       survey_results_df,
+       ncols=5, nrows=6,
+       normalize="count",
+       robust_vmax_percentile=99,
+       save_path=output_dir / "affect_grid_all_videos.png",
+    )
 
     # Plot separate heatmaps for each video
-    #utils.plotting_utils.plot_affect_grid(
-    #   survey_results_df,
-    #   video_id=None,
-    #   save_path=output_dir / "affect_grid_heatmaps")
+    utils.plotting_utils.plot_affect_grid(
+       survey_results_df,
+       video_id=None,
+       save_path=output_dir / "affect_grid_heatmaps")
 
     # Plot affect grid usage with marginals (overall)
-    #utils.plotting_utils.plot_affect_grid_usage_with_marginals(
-    #   survey_results_df,
-    #   normalize="count",
-    #   save_path=output_dir / "affect_grid_usage.png",
-    #)
+    utils.plotting_utils.plot_affect_grid_usage_with_marginals(
+       survey_results_df,
+       normalize="count",
+       save_path=output_dir / "affect_grid_usage.png",
+    )
 
     # Plot affective quadrant distribution for each video
-    #utils.plotting_utils.create_quadrant_distribution_plot(
-    #   survey_results_df,
-    #   video_id_column=c.VIDEO_ID_COL,
-    #   output_path=output_dir / "affective_quadrant_distribution_per_video.png"
-    #)
+    utils.plotting_utils.create_quadrant_distribution_plot(
+       survey_results_df,
+       video_id_column=c.VIDEO_ID_COL,
+       output_path=output_dir / "affective_quadrant_distribution_per_video.png"
+    )
 
     # ==============================================================================
     # PHASE 4: VIDEO-LEVEL AFFECT METRICS & PF/NF DISAGREEMENT ANALYSIS (RQ2)
@@ -116,11 +116,11 @@ def main():
     )
 
     # Plot video-level affect means with vectors for OE groups
-    #utils.plotting_utils.plot_video_affect_means_with_vectors(
-    #   video_level_scores,
-    #   save_path=output_dir / "video_affect_vectors_oe.png",
-    #   oe_col="oe_mode",
-    #)
+    utils.plotting_utils.plot_video_affect_means_with_vectors(
+       video_level_scores,
+       save_path=output_dir / "video_affect_vectors_oe.png",
+       oe_col="oe_mode",
+    )
 
     # Add PF/NF label counts to video-level scores and save to CSV
     video_level_scores = utils.processing_utils.add_factor_counts_to_scores(
@@ -193,15 +193,17 @@ def main():
     metrics = [
         "dispersion_mean_distance",
         "anisotropy_index",
-        "affect_state_entropy",
         "polarization_index",
+        "affect_state_entropy",
+        "pf_nf_label_entropy"
     ]
 
     metric_labels = {
         "dispersion_mean_distance": "Dispersion",
         "anisotropy_index": "Anisotropy",
-        "affect_state_entropy": "Quadrant entropy",
         "polarization_index": "Polarization",
+        "affect_state_entropy": "Quadrant entropy",
+        "pf_nf_label_entropy": "Cue entropy"
     }
 
     # Plot subgroup metrics with bootstrap confidence intervals and save the figure
@@ -224,7 +226,9 @@ def main():
 
     metric_cols = [
         "valence_mean",
+        "valence_sd",
         "arousal_mean",
+        "arousal_sd",
         "oe_mean",
         "oe_mode",
         "dispersion_mean_distance",
