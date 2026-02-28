@@ -47,12 +47,12 @@ def main():
     survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
 
     # Clean and preprocess the survey response data
-    survey_results_df = utils.processing_utils.filter_aggregate_results(survey_results_df,
-                                                                        age=True,
-                                                                        gender=True,
-                                                                        cycling_environment=True,
-                                                                        cycling_frequency=True,
-                                                                        cycling_confidence=True)
+    survey_results_df = utils.processing_utils.filter_results(survey_results_df,
+                                                              age=True,
+                                                              gender=True,
+                                                              cycling_environment=True,
+                                                              cycling_frequency=True,
+                                                              cycling_confidence=True)
     survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
     survey_results_df = utils.processing_utils.assign_affective_states(survey_results_df)
 
