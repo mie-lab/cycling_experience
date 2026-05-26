@@ -25,7 +25,6 @@ def main():
 
     online_results_file = Path(config["filenames"]["survey_results_file"])
     online_sequence_file = Path(config["filenames"]["online_sequence_file"])
-
     video_predictions_file = Path(config["filenames"]["video_predictions_file"])
 
     lab_results_file = Path(config["filenames"]["lab_study_results_file"])
@@ -47,48 +46,56 @@ def main():
     survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, online_seq_df, id_col=c.PARTICIPANT_ID)
 
     # Clean and preprocess the survey response data
-    survey_results_df = utils.processing_utils.filter_aggregate_results(
+    survey_results_df = utils.processing_utils.filter_results(survey_results_df)
+    survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
+
+    # Aggregate demographic categories to ensure sufficient sample size in each group
+    survey_results_df = utils.processing_utils.aggregate_by_characteristics(
         survey_results_df,
         age=True,
         gender=True,
-        by_country=True,
-        cycling_environment=True,
         cycling_frequency=True,
-        cycling_confidence=True
+        cycling_confidence=True,
+        cycling_purpose=True,
+        cycling_environment=True,
+        familiarity=True,
+        is_swiss=True
     )
-    survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
-    survey_results_df = utils.processing_utils.assign_affective_states(survey_results_df)
 
-    # Aggregate individual ratings to get a single summary score per video.
-    # TODO: doublecheck how the function differ from aggregate_video_level_scores
+    # Calculate video-level affect metrics and save to CSV
     online_video_level_scores = utils.processing_utils.calculate_video_level_scores(
-        survey_results_df, rating_col=c.AG
-    ).rename(columns={c.VALENCE: 'valence_online', c.AROUSAL: 'arousal_online'})
+        survey_results_df,
+        lab_bool=True
+    )
+
+    online_video_level_scores = online_video_level_scores.rename(columns={c.VALENCE: 'valence_online', c.AROUSAL: 'arousal_online'})
 
     log.info('Phase 2.2: Loading and Processing Lab Study Data')
     lab_results_df = pd.read_excel(lab_results_file).set_index(c.PARTICIPANT_ID, drop=True)
-    lab_results_df = utils.processing_utils.filter_aggregate_results(
+
+    lab_results_df = utils.processing_utils.aggregate_by_characteristics(
         lab_results_df,
-        consent=False,
-        duration=False,
-        location=False,
+        age=True,
         gender=True,
-        cycling_environment=True,
         cycling_frequency=True,
-        cycling_confidence=True
+        cycling_confidence=True,
+        cycling_purpose=True,
+        cycling_environment=True
     )
 
-    demographics_df = lab_results_df[c.DEMOGRAPHIC_COLUMNS]
-
-    lab_seq_df = pd.read_csv(lab_sequence_file)
-    experiment_setup = pd.read_csv(lab_setup_file, header=None).set_index(0, drop=True)
+    demographics_df = lab_results_df[
+        [col for col in c.DEMOGRAPHIC_COLUMNS if col != c.IS_SWISS]
+    ]
 
     lab_results_df = (
         lab_results_df
-        .drop(columns=c.DEMOGRAPHIC_COLUMNS + [c.START, c.END])
-        .replace(r'^\s*(\d+).*$', r'\1', regex=True)
+        .drop(columns=[col for col in c.DEMOGRAPHIC_COLUMNS if col != c.IS_SWISS] + [c.START, c.END])
         .apply(pd.to_numeric, errors='coerce')
     )
+
+    log.info('reading the lab video sequence and experiment setup files')
+    lab_seq_df = pd.read_csv(lab_sequence_file)
+    experiment_setup = pd.read_csv(lab_setup_file, header=None).set_index(0, drop=True)
 
     log.info('Phase 2.3: Loading and Processing Video Prediction Data')
     video_score_predictions = pd.read_csv(video_predictions_file)
@@ -105,38 +112,36 @@ def main():
         c.VIDEO_COUNTS
     )
     df1 = utils.helper_functions.trial_dict_to_df(df_baseline)
-    df1 = utils.processing_utils.add_valence_arousal(df1, 'rating')
+    df1 = utils.processing_utils.add_valence_arousal(df1, ag_col='rating')
 
     # Aggregate individual ratings to get a single summary score per video.
-    lab_video_scores = utils.processing_utils.calculate_video_level_scores(df1, rating_col='rating')
+    lab_video_scores = utils.processing_utils.calculate_video_level_scores(df1, lab_bool=True)
 
     # Merge lab scores with online scores and model predictions for comparison.
     video_level_scores = pd.merge(lab_video_scores, online_video_level_scores, on=c.VIDEO_ID_COL, how='left')
     video_level_scores = pd.merge(video_level_scores, video_score_predictions, on=c.VIDEO_ID_COL, how='left')
 
-    # Plot comparisons between lab scores, online scores, and model predictions.
-    utils.helper_functions.get_video_level_metrics(video_level_scores, c.VALENCE, 'valence_prediction',
-                                                   'valence_online')
+    # print comparisons between lab scores, online scores, and model predictions.
+    utils.helper_functions.get_video_level_metrics(video_level_scores, c.VALENCE, 'valence_prediction', 'valence_online')
 
-    print(video_level_scores[['valence', 'valence_online', 'valence_prediction']])
-    utils.helper_functions.check_variance_homogeneity(df1, c.PARTICIPANT_ID, c.VALENCE)
-    utils.helper_functions.check_variance_homogeneity(df1, c.VIDEO_ID_COL, c.VALENCE)
+    #utils.helper_functions.check_variance_homogeneity(df1, c.PARTICIPANT_ID, c.VALENCE)
+    #utils.helper_functions.check_variance_homogeneity(df1, c.VIDEO_ID_COL, c.VALENCE)
 
-    utils.plotting_utils.plot_bland_altman(
-        df=video_level_scores,
-        measurement1='valence',
-        measurement2='valence_online',
-        label_col=c.VIDEO_ID_COL,
-        save_path=output_dir / 'bland_altman_valence_video.png'
-    )
+    #utils.plotting_utils.plot_bland_altman(
+    #    df=video_level_scores,
+    #    measurement1='valence',
+    #    measurement2='valence_online',
+    #    label_col=c.VIDEO_ID_COL,
+    #    save_path=output_dir / 'bland_altman_valence_video.png'
+    #)
 
-    utils.plotting_utils.plot_bland_altman(
-        df=video_level_scores,
-        measurement1='arousal',
-        measurement2='arousal_online',
-        label_col=c.VIDEO_ID_COL,
-        save_path=output_dir / 'bland_altman_arousal_video.png'
-    )
+    #utils.plotting_utils.plot_bland_altman(
+    #    df=video_level_scores,
+    #    measurement1='arousal',
+    #    measurement2='arousal_online',
+    #    label_col=c.VIDEO_ID_COL,
+    #    save_path=output_dir / 'bland_altman_arousal_video.png'
+    #)
 
     # ==============================================================================
     # PHASE 3: BLOCK 2 ANALYSIS (EQUAL SCENARIO)
@@ -152,15 +157,21 @@ def main():
     )
     df_equal = pd.merge(df_equal, demographics_df, on=c.PARTICIPANT_ID, how='left')
 
-    file_name = output_dir / 'trial_2_overall_ratings.png'
-    utils.plotting_utils.plot_violin_panels(
+    utils.plotting_utils.plot_violin_trend_panels(
         df_equal,
+        'Equally Positive and Negative Route',
         sequence_order=c.TRIAL_2_PLOT_ORDER,
-        save_path=file_name
+        save_path=output_dir / 'trial_2_trends_violin.png'
     )
 
-    file_name = output_dir / 'trial_2_rankings.png'
-    utils.plotting_utils.plot_ranking_by_nb_pos(df_equal, 'NB_position', c.TRIAL_2_PARAMS, 'ranking', file_name)
+    utils.plotting_utils.plot_sequence_trend_panels(
+        df_equal,
+        sequence_order=c.TRIAL_2_PLOT_ORDER,
+        estimator="mean",
+        save_path=output_dir / "trial_2_trends_CI.png",
+    )
+
+    #utils.plotting_utils.plot_ranking_by_nb_pos(df_equal, 'NB_position', c.TRIAL_2_PARAMS, 'ranking', file_name)
 
     # ==============================================================================
     # PHASE 4: BLOCK 3 ANALYSIS (POSITIVE SCENARIO)
@@ -178,22 +189,28 @@ def main():
     )
     df_positive = pd.merge(df_positive, demographics_df, on=c.PARTICIPANT_ID, how='left')
 
-    # --- 2. Generate and Save Visualizations ---
-    ratings_plot_path = output_dir / 'trial_2_overall_ratings.png'
-    utils.plotting_utils.plot_violin_panels(
-        df=df_equal,
-        sequence_order=c.TRIAL_2_PLOT_ORDER,
-        save_path=ratings_plot_path
+    utils.plotting_utils.plot_violin_trend_panels(
+        df_positive,
+        'Predominantly Positive Route',
+        sequence_order=c.TRIAL_3_PLOT_ORDER,
+        save_path=output_dir / 'trial_3_trends_violin.png'
     )
 
-    rankings_plot_path = output_dir / 'trial_2_rankings.png'
-    utils.plotting_utils.plot_ranking_by_nb_pos(
-        df=df_equal,
-        position_col='NB_position',
-        params=c.TRIAL_2_PARAMS,
-        ranking_col='ranking',
-        save_path=rankings_plot_path
+    utils.plotting_utils.plot_sequence_trend_panels(
+        df_positive,
+        sequence_order=c.TRIAL_3_PLOT_ORDER,
+        estimator="mean",
+        save_path=output_dir / "trial_3_trends_CI.png",
     )
+
+    #rankings_plot_path = output_dir / 'trial_2_rankings.png'
+    #utils.plotting_utils.plot_ranking_by_nb_pos(
+    #    df=df_equal,
+    #    position_col='NB_position',
+    #    params=c.TRIAL_2_PARAMS,
+    #    ranking_col='ranking',
+    #    save_path=rankings_plot_path
+    #)
 
     # ==============================================================================
     # PHASE 5: BLOCK 4 ANALYSIS (NEGATIVE SCENARIO)
@@ -212,21 +229,28 @@ def main():
     df_negative = pd.merge(df_negative, demographics_df, on=c.PARTICIPANT_ID, how='left')
 
     # --- 2. Generate and Save Visualizations ---
-    ratings_plot_path = output_dir / 'trial_4_overall_ratings.png'
-    utils.plotting_utils.plot_violin_panels(
+    utils.plotting_utils.plot_violin_trend_panels(
         df_negative,
+        'Predominantly Negative Route',
         sequence_order=c.TRIAL_4_PLOT_ORDER,
-        save_path=ratings_plot_path
+        save_path=output_dir / 'trial_4_trends_violin.png'
     )
 
-    rankings_plot_path = output_dir / 'trial_4_rankings.png'
-    utils.plotting_utils.plot_ranking_by_nb_pos(
-        df=df_negative,
-        position_col='B_position',
-        params=c.TRIAL_4_PARAMS,
-        ranking_col='ranking',
-        save_path=rankings_plot_path
+    utils.plotting_utils.plot_sequence_trend_panels(
+        df_negative,
+        sequence_order=c.TRIAL_4_PLOT_ORDER,
+        estimator="mean",
+        save_path=output_dir / "trial_4_trends_CI.png",
     )
+
+    #rankings_plot_path = output_dir / 'trial_4_rankings.png'
+    #utils.plotting_utils.plot_ranking_by_nb_pos(
+    #    df=df_negative,
+    #    position_col='B_position',
+    #    params=c.TRIAL_4_PARAMS,
+    #    ranking_col='ranking',
+    #    save_path=rankings_plot_path
+    #)
 
     # ==============================================================================
     # PHASE 6: STATISTICAL MODELING (LINEAR MIXED-EFFECTS MODELS)
