@@ -93,6 +93,7 @@ DEPENDENT_VARIABLES = (VALENCE, AROUSAL)
 TARGET_COL = VALENCE
 
 IS_SWISS = 'is_swiss'
+
 DEMOGRAPHIC_COLUMNS = [GENDER, AGE, CYCL_FREQ, CYCL_PURP, CYCL_CONF, CYCL_ENV, IS_SWISS]
 
 CATEGORY_ORDERS = {
@@ -110,7 +111,8 @@ LABEL_COLS = [
     'PF: Cycling surface quality',
     'PF: Pedestrians on a cycling way',
     'PF: Pedestrians on a separate sidewalk',
-    'PF: Slope', 'PF: Speed of traffic',
+    'PF: Slope',
+    'PF: Speed of traffic',
     'PF: Surrounding buildings',
     'PF: Surrounding greenery',
     'PF: Traffic volume',
@@ -120,7 +122,8 @@ LABEL_COLS = [
     'NF: Cycling surface quality',
     'NF: Pedestrians on a cycling way',
     'NF: Pedestrians on a separate sidewalk',
-    'NF: Slope', 'NF: Speed of traffic',
+    'NF: Slope',
+    'NF: Speed of traffic',
     'NF: Surrounding buildings',
     'NF: Surrounding greenery',
     'NF: Traffic volume',
@@ -133,7 +136,9 @@ DATA_COLS = [
     "motorized_traffic_speed_kmh",
     "traffic_volume",
     "average_greenery_share",
-    "motor_vehicle_overtakes_presence"
+    "motor_vehicle_overtakes_count",
+    #"motor_vehicle_overtakes_presence",
+    #"ped_and_cycl_count"
 ]
 NUMERIC_FIELDS = [
     "car_lanes_total_count",
@@ -240,4 +245,18 @@ TRIAL_4_PLOT_ORDER = [
     'NB → B → NB',  # Outlier 'B' at position 2
     'NB → NB → B'  # Outlier 'B' at position 3
 ]
+
+CATEGORICAL_MAPPINGS = {
+        'surface_type': {
+            'asphalt_colored': 1.0,
+            'asphalt': 0.66,
+            'asphalt_cracks_present': 0.33,
+            'gravel': 0.0
+        },
+        'bike_infra_type': {
+            'shared_path': 1.0,
+            'advisory': 0.5,
+            'no_bike_infra': 0.0
+        }
+    }
 
