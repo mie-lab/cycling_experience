@@ -5,8 +5,6 @@ from semopy import Model, semplot
 from semopy.stats import calc_stats
 from sklearn.decomposition import PCA
 import configparser
-import utils.helper_functions
-import utils.processing_utils
 from utils.physiological_data_utils import map_physiological_segments_to_videos
 import matplotlib
 import lingam
@@ -38,27 +36,114 @@ log = logging.getLogger(__name__)
 # UTILS: TRANSFORMATIONS
 # -------------------------------------------------------------------
 
-def extract_interaction_wald(model, interaction_name, target_variable):
-    """
-    Extracts Wald stats for a specific target ~ interaction path.
-    Usage: extract_interaction_wald(model, 'Infra_Dynamic_Interaction', 'valence')
-    """
-    est_df = model.inspect()
 
-    # Filter by BOTH predictor (rval) AND target (lval)
+def cluster_bootstrap_sem(df_raw_pre, scenario_name, config, model_desc,
+                          cluster_col, id_col, n_boot=2000, seed=42):
+    """
+    Cluster bootstrap clustered on VIDEO. PCA indices + within-subject centering
+    are recomputed per resample, so SEs absorb both clustering and index uncertainty.
+    df_raw_pre: dataframe AFTER log-transform but BEFORE PCA index construction,
+                with raw env features still present and env vars z-scored.
+    """
+    rng = np.random.default_rng(seed)
+    clusters = df_raw_pre[cluster_col].unique()
+    n_clusters = len(clusters)
+    estimates, n_ok = [], 0
+
+    for b in range(n_boot):
+        drawn = rng.choice(clusters, size=n_clusters, replace=True)
+        parts = []
+        for rep_id, cl in enumerate(drawn):
+            block = df_raw_pre[df_raw_pre[cluster_col] == cl].copy()
+            block["_rep"] = rep_id  # keep duplicated clusters distinct
+            parts.append(block)
+        boot = pd.concat(parts, ignore_index=True)
+
+        try:
+            # 1. recompute PCA indices on this resample
+            for idx_name, col_key, ref_key in [
+                ("InfraIndex", "infra_cols", "infra_ref"),
+                ("VisualIndex", "visual_cols", "visual_ref"),
+                ("DynamicIndex", "dynamic_cols", "dynamic_ref"),
+            ]:
+                scores, _, _ = create_aligned_index(
+                    boot, config[col_key], idx_name, reference_col=config[ref_key])
+                boot[idx_name] = scores.values
+
+            # 2. interaction terms
+            boot["Infra_Dynamic_Interaction"] = boot["InfraIndex"] * boot["DynamicIndex"]
+            boot["Visual_Dynamic_Interaction"] = boot["VisualIndex"] * boot["DynamicIndex"]
+            boot["Infra_Visual_Interaction"] = boot["InfraIndex"] * boot["VisualIndex"]
+
+            # 3. refit semopy
+            m = Model(model_desc)
+            m.fit(boot)
+            ins = m.inspect()
+            paths = ins[ins["op"] == "~"].copy()
+            paths["param"] = paths["lval"] + " ~ " + paths["rval"]
+            estimates.append(dict(zip(paths["param"], paths["Estimate"])))
+            n_ok += 1
+        except Exception:
+            continue
+
+    boot_df = pd.DataFrame(estimates)
+    summary = pd.DataFrame({
+        "boot_mean": boot_df.mean(),
+        "boot_se": boot_df.std(ddof=1),
+        "ci_lower": boot_df.quantile(0.025),
+        "ci_upper": boot_df.quantile(0.975),
+        "p_boot": boot_df.apply(lambda c: 2 * min((c <= 0).mean(), (c >= 0).mean())),
+    })
+    log.info(f"[Bootstrap {scenario_name}] converged {n_ok}/{n_boot}")
+    return summary, boot_df
+
+
+def run_video_aggregated_sem(df_raw, scenarios_config, model_catalog,
+                             video_col, output_dir):
+    """Refit headline models on video-level means (N≈42). Sidesteps nesting
+    entirely since environmental predictors are constant within video."""
+    rows = []
+    for scen, config in scenarios_config.items():
+        idx_cols = [f"InfraIndex_{scen}", f"VisualIndex_{scen}", f"DynamicIndex_{scen}"]
+        agg_cols = idx_cols + ["valence", "arousal", "PPGIndex", "EDAIndex"]
+        agg = df_raw.groupby(video_col)[agg_cols].mean().reset_index()
+        agg = agg.rename(columns={f"InfraIndex_{scen}": "InfraIndex",
+                                  f"VisualIndex_{scen}": "VisualIndex",
+                                  f"DynamicIndex_{scen}": "DynamicIndex"})
+        agg["Infra_Dynamic_Interaction"] = agg["InfraIndex"] * agg["DynamicIndex"]
+        agg["Visual_Dynamic_Interaction"] = agg["VisualIndex"] * agg["DynamicIndex"]
+        agg["Infra_Visual_Interaction"] = agg["InfraIndex"] * agg["VisualIndex"]
+
+        for mname in ["04_Full_Environment", "09_Mod_Infra_Buffers_Traffic"]:
+            try:
+                m = Model(model_catalog[mname]);
+                m.fit(agg)
+                r2 = calculate_sem_r2(m, agg)
+                rows.append({"Scenario": scen, "Model": mname, "N_videos": len(agg),
+                             "R2_Valence": r2.get("valence"), "R2_Arousal": r2.get("arousal")})
+            except Exception as e:
+                log.warning(f"Aggregated {scen}/{mname} failed: {e}")
+    out = pd.DataFrame(rows)
+    out.to_csv(output_dir / "SEM_video_aggregated_robustness.csv", index=False)
+    log.info("Saved SEM_video_aggregated_robustness.csv")
+    return out
+
+
+def extract_interaction_wald(model, interaction_name, target_variable):
+    est_df = model.inspect(std_est=True)
     row = est_df[
         (est_df["lval"] == target_variable) &
         (est_df["op"] == "~") &
         (est_df["rval"] == interaction_name)
-    ]
-
+        ]
     if row.empty:
         return None
-
     stats = row.iloc[0]
-
+    # standardized estimate column (semopy: "Est. Std")
+    std_col = next((col for col in ["Est. Std", "Std. Est.", "std_est"]
+                    if col in row.columns), "Estimate")
     return {
-        "Estimate": stats["Estimate"],
+        "Estimate": stats[std_col],
         "SE": stats["Std. Err"],
         "z": stats["z-value"],
         "p": stats["p-value"]
@@ -66,7 +151,6 @@ def extract_interaction_wald(model, interaction_name, target_variable):
 
 
 def plot_valence_arousal_scatter(df, output_dir):
-
     stats = df.groupby(c.VIDEO_ID_COL).agg(
         mean_valence=("valence", "mean"),
         mean_arousal=("arousal", "mean"),
@@ -229,6 +313,7 @@ def assess_lingam_model_fit(model, df, cols, output_dir, scenario_name):
         print(f"  Global Fit Stats: Skipped ({e})")
 
 
+"""
 def check_lingam_data_assumptions(df, cols, output_dir, scenario_name=""):
     log.info(f"--- Checking Assumptions ({scenario_name}) ---")
     results = []
@@ -262,8 +347,6 @@ def check_lingam_data_assumptions(df, cols, output_dir, scenario_name=""):
 
         try:
             model_quad = sm.OLS(y, df_quad).fit()
-
-            # Extract quadratic p-value safely using label lookup
             quad_p = float(model_quad.pvalues.loc[f"{best_pred}_2"])
             is_linear = quad_p > 0.01
 
@@ -278,6 +361,71 @@ def check_lingam_data_assumptions(df, cols, output_dir, scenario_name=""):
             "Strongest_Link": best_pred,
             "Shapiro_p": round(sw_p, 4),
             "Quad_p": round(quad_p, 4) if not np.isnan(quad_p) else "NA"
+        })
+
+    out = pd.DataFrame(results)
+    out.to_csv(output_dir / f"lingam_assumptions_{scenario_name}.csv", index=False)
+    return out
+"""
+
+
+def check_lingam_data_assumptions(df, cols, output_dir, scenario_name="",
+                                  parent_map=None):
+    log.info(f"--- Checking Assumptions ({scenario_name}) ---")
+    df_clean = df[cols].dropna()
+
+    env_vars = ["InfraIndex", "VisualIndex", "DynamicIndex"]
+    human_vars = [v for v in cols if v not in env_vars]
+
+    # Forward causal parents — MUST mirror prior_knowledge in run_lingam_discovery
+    if parent_map is None:
+        parent_map = {
+            "InfraIndex": [],  # root
+            "DynamicIndex": ["InfraIndex"],  # Infra -> Dynamic
+            "VisualIndex": ["InfraIndex", "DynamicIndex"],  # Infra,Dynamic -> Visual
+        }
+        for h in human_vars:  # env -> affect/physio
+            parent_map[h] = ["InfraIndex", "VisualIndex", "DynamicIndex"]
+
+    results = []
+    for target in cols:
+        # 1. Non-Gaussianity (direction-free)
+        sw_stat, sw_p = stats.shapiro(df_clean[target])
+
+        # 2. Linearity on forward causal edge(s)
+        parents = [p for p in parent_map.get(target, []) if p in df_clean.columns]
+
+        if not parents:
+            quad_p, r2_gain, flag, label = np.nan, np.nan, "NA (root)", "—"
+        else:
+            y = df_clean[target]
+            X_lin = sm.add_constant(df_clean[parents])
+            X_quad = df_clean[parents].copy()
+            for p in parents:
+                X_quad[f"{p}_2"] = df_clean[p] ** 2
+            X_quad = sm.add_constant(X_quad)
+
+            try:
+                m_lin = sm.OLS(y, X_lin).fit()
+                m_quad = sm.OLS(y, X_quad).fit()
+
+                # Joint F-test: are ALL squared terms zero?
+                hyp = ", ".join(f"{p}_2 = 0" for p in parents)
+                quad_p = float(np.ravel(m_quad.f_test(hyp).pvalue)[0])
+                r2_gain = m_quad.rsquared - m_lin.rsquared
+                flag = "PASS" if quad_p > 0.01 else "WARN"
+            except Exception:
+                quad_p, r2_gain, flag = np.nan, np.nan, "PASS"
+            label = " + ".join(parents)
+
+        results.append({
+            "Variable": target,
+            "Non-Gaussian (p<.05)": "PASS" if sw_p < 0.05 else "FAIL",
+            "Linearity (Quad p>.01)": flag,
+            "Causal_Parents": label,
+            "Shapiro_p": round(sw_p, 4),
+            "Quad_p": round(quad_p, 4) if not np.isnan(quad_p) else "NA",
+            "Quad_R2_gain": round(r2_gain, 4) if not np.isnan(r2_gain) else "NA",
         })
 
     out = pd.DataFrame(results)
@@ -376,7 +524,7 @@ def generate_descriptives(df, output_dir=None):
         "Gender": ["Male", "Female"],
         "Cycling_environment": ["Urban area", "Rural area"],
         "Cycling_purpose": ["Commuting (e.g., work, school)", "Recreational / leisure", "Exercise / fitness"],
-        "Cycling_frequency": ["Infrequent", "Ocasional", "Regular"],
+        "Cycling_frequency": ["Infrequent", "Occasional", "Regular"],
     }
 
     demo_vars = ["Gender", "Age", "Cycling_frequency", "Cycling_confidence", "Cycling_purpose", "Cycling_environment"]
@@ -452,7 +600,9 @@ def analyze_street_morphology(df_ground):
 
 
 def create_aligned_index(df, cols, index_name, reference_col=None):
-    log.info(f"--- Generating Aligned PCA Index: {index_name} ---")
+    """Creates a PCA-based index (PC1) from the specified columns, sign-aligned
+    so that a higher score reflects the reference variable's positive direction."""
+
     data = df[cols].fillna(0)
     pca = PCA(n_components=1, svd_solver='full')
     pc1 = pca.fit_transform(data).flatten()
@@ -461,8 +611,6 @@ def create_aligned_index(df, cols, index_name, reference_col=None):
     variance_expl = pca.explained_variance_ratio_[0]
     loadings = pca.components_[0]
     loading_dict = dict(zip(cols, loadings))
-
-    log.info(f"{index_name}: PC1 explains {variance_expl * 100:.2f}% variance")
 
     # Alignment
     flip_factor = 1
@@ -489,7 +637,7 @@ def run_sensitivity_analysis(df, scenarios_config, outcomes, output_dir):
     for scenario_name, config in scenarios_config.items():
         log.info(f"[Sensitivity] Evaluating scenario: {scenario_name}")
 
-        for domain in ["infra", "landuse", "visual", "dynamic"]:
+        for domain in ["infra", "visual", "dynamic"]:
 
             domain_cols = config.get(f"{domain}_cols")
             ref_var = config.get(f"{domain}_ref")  # reference var for sign direction
@@ -498,7 +646,6 @@ def run_sensitivity_analysis(df, scenarios_config, outcomes, output_dir):
                 log.warning(f"[Sensitivity] {scenario_name}/{domain} — insufficient columns")
                 continue
 
-            # Extract data
             data = df[domain_cols].fillna(0)
 
             # PCA
@@ -599,7 +746,7 @@ def run_sem_model(model_desc, df, name, output_dir, plot_graph=False):
         return model, fit
     except Exception as e:
         log.error(f"Model {name} failed: {e}")
-        return None
+        return None, None
 
 
 def run_lingam_discovery(df, cols, output_dir, scenario_name):
@@ -623,6 +770,10 @@ def run_lingam_discovery(df, cols, output_dir, scenario_name):
         prior[idx['DynamicIndex'], idx['VisualIndex']] = 0
         prior[idx['VisualIndex'], idx['DynamicIndex']] = 0
 
+        if 'valence' in cols and 'arousal' in cols:
+            prior[idx['valence'], idx['arousal']] = 0
+            prior[idx['arousal'], idx['valence']] = 0
+
         # -------------------------------------------------------
         # 1. Run Standard Model (for Coefficients)
         # -------------------------------------------------------
@@ -637,7 +788,6 @@ def run_lingam_discovery(df, cols, output_dir, scenario_name):
         # Save Coefficient Matrix (The "Effect Size")
         adj_df = pd.DataFrame(model.adjacency_matrix_, columns=cols, index=cols)
         adj_df.to_csv(output_dir / f"lingam_matrix_{scenario_name}.csv")
-
 
         log.info(f"--- Running LiNGAM Bootstrap for {scenario_name} ---")
 
@@ -714,7 +864,6 @@ def plot_correlation_matrix(
         output_dir,
         file_name="correlation_matrix.png"
 ):
-
     plt.figure(figsize=(18, 14))
     mask = np.triu(np.ones_like(corr_plot, dtype=bool))
 
@@ -771,14 +920,13 @@ def plot_correlation_matrix(
 
 
 def plot_explained_variance(output_dir):
-
     df = pd.read_csv(Path(output_dir, "SEM_model_comparison.csv"))
 
     # We select the specific Model + Scenario combinations that tell the story
     # logic: (Scenario, Model, Display Label)
     target_chain = [
         ("Planner_View", "04_Full_Environment", "M1-Static\n(GIS Only)"),
-        ("Visual_Cyclist", "04_Full_Environment","M2-Visual\n(Segmentation)"),
+        ("Visual_Cyclist", "04_Full_Environment", "M2-Visual\n(Segmentation)"),
         ("Temporal_Cyclist", "04_Full_Environment", "M3-Temporal\n(MLLM Events)"),
         ("Visual_Temporal_Cyclist", "04_Full_Environment", "M4-Integrated\n(Segmentation+MLLM Events)")
     ]
@@ -827,7 +975,7 @@ def plot_explained_variance(output_dir):
     ax.set_title("Information Scenarios", fontsize=12)
     ax.set_xticks(x)
     ax.set_xticklabels(labels, fontsize=10)
-    ax.set_ylim(0, 0.6)  # Set limit slightly higher than max value (0.46)
+    ax.set_ylim(0, 0.6)
 
     # Grid and Layout
     ax.grid(axis='y', linestyle='--', alpha=0.5)
@@ -840,9 +988,309 @@ def plot_explained_variance(output_dir):
     print("Saved corrected: information_scenarios.png")
 
 
+def generate_category_level_correlations(df, scenarios_config, output_dir):
+    """
+    Addresses Reviewer 3, Comment 3.1:
+    Generates Table 6 (Glanceable overview of category-level associations)
+    and plots them as side-by-side heatmaps with swapped axes (3 rows, 4 columns).
+    """
+    log.info("--- Generating Category-Level Bivariate Correlations (Table 6 & Heatmaps) ---")
+    results = []
+
+    for scenario in scenarios_config.keys():
+        cols = [
+            f"InfraIndex_{scenario}",
+            f"VisualIndex_{scenario}",
+            f"DynamicIndex_{scenario}",
+            "valence",
+            "arousal"
+        ]
+
+        # Calculate Spearman correlation matrix for the category-level indices
+        corr_matrix = df[cols].corr(method='spearman')
+
+        for idx_type in ["InfraIndex", "VisualIndex", "DynamicIndex"]:
+            col_name = f"{idx_type}_{scenario}"
+            results.append({
+                "Scenario": scenario,
+                "Category_Index": idx_type,
+                "Valence_r": round(corr_matrix.loc[col_name, "valence"], 3),
+                "Arousal_r": round(corr_matrix.loc[col_name, "arousal"], 3)
+            })
+
+    df_res = pd.DataFrame(results)
+    df_res.to_csv(output_dir / "Table6_category_level_correlations.csv", index=False)
+
+    print("\n=== TABLE 6: CATEGORY-LEVEL CORRELATIONS (Reviewer 3.1) ===")
+    print(df_res.to_string(index=False))
+
+    # ==============================================================
+    # GENERATE SIDE-BY-SIDE HEATMAPS (SWAPPED AXES)
+    # ==============================================================
+
+    # Pivot the data for the heatmaps - Index is now Channel, Columns are Scenarios
+    df_val = df_res.pivot(index='Category_Index', columns='Scenario', values='Valence_r')
+    df_ar = df_res.pivot(index='Category_Index', columns='Scenario', values='Arousal_r')
+
+    # Define logical ordering for rows and columns
+    scenarios_order = [
+        "Planner_View",
+        "Visual_Cyclist",
+        "Temporal_Cyclist",
+        "Visual_Temporal_Cyclist"
+    ]
+    cols_order = ["InfraIndex", "VisualIndex", "DynamicIndex"]
+
+    # Reindex to ensure order is fixed (Rows = Channels, Cols = Scenarios)
+    df_val = df_val.reindex(index=cols_order, columns=scenarios_order)
+    df_ar = df_ar.reindex(index=cols_order, columns=scenarios_order)
+
+    # Prettier Labels for the plot
+    scenario_labels = {
+        "Planner_View": "Planner",
+        "Visual_Cyclist": "Visual",
+        "Temporal_Cyclist": "Temporal",
+        "Visual_Temporal_Cyclist": "Visual-Temporal \n (Integrated)"
+    }
+
+    category_labels = {
+        "InfraIndex": "Static Index",
+        "VisualIndex": "Visual Index",
+        "DynamicIndex": "Dynamic Index"
+    }
+
+    # Apply labels (swapped logic from previous version)
+    df_val.index = [category_labels.get(i, i) for i in df_val.index]
+    df_ar.index = [category_labels.get(i, i) for i in df_ar.index]
+
+    df_val.columns = [scenario_labels.get(c, c) for c in df_val.columns]
+    df_ar.columns = [scenario_labels.get(c, c) for c in df_ar.columns]
+
+    # Plotting - Wider figsize for the 4-column layout
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+
+    # Valence Heatmap
+    sns.heatmap(df_val, annot=True, fmt=".2f", cmap="vlag", vmin=-1, vmax=1,
+                linewidths=0.4, square=True, ax=axes[0], cbar_kws={'label': 'Spearman ρ'}, annot_kws={"size": 12})
+    axes[0].set_title("Correlation with Valence", fontsize=14, pad=10)
+    axes[0].set_xlabel("Information Scenario", fontsize=14, labelpad=10)
+    axes[0].set_ylabel("Information Channel", fontsize=14)
+    axes[0].tick_params(axis='y', rotation=0, labelsize=12)
+    axes[0].tick_params(axis='x', rotation=0, labelsize=12)
+
+    # Arousal Heatmap
+    sns.heatmap(df_ar, annot=True, fmt=".2f", cmap="vlag", vmin=-1, vmax=1,
+                linewidths=0.4, square=True, ax=axes[1], cbar_kws={'label': 'Spearman ρ'}, annot_kws={"size": 12})
+    axes[1].set_title("Correlation with Arousal", fontsize=14, pad=10)
+    axes[1].set_xlabel("Information Scenario", fontsize=14, labelpad=10)
+    axes[1].set_ylabel("")
+    axes[1].tick_params(axis='x', rotation=0, labelsize=12)
+
+    fig.suptitle("Category-Level Baseline Correlations Across Scenarios", fontsize=16, y=1.05)
+
+    plt.tight_layout()
+    out_path = Path(output_dir, "category_level_heatmaps.png")
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    log.info(f"Saved category-level heatmaps to: {out_path}")
+
+
+def run_top3_sensitivity_analysis(df, scenarios_config, outcomes, output_dir):
+    """
+    Addresses Reviewer 3, Comment 3.2:
+    Reconstructs PCA indices using ONLY the top 3 features most strongly
+    correlated with the outcome, testing if the Dynamic channel still dominates.
+    """
+    log.info("--- Running Top-3 Feature Sensitivity Analysis (Reviewer 3.2) ---")
+    results = []
+
+    for scenario_name, config in scenarios_config.items():
+        for out in outcomes:
+            scenario_res = {"Scenario": scenario_name, "Outcome": out}
+
+            for domain in ["infra", "visual", "dynamic"]:
+                domain_cols = config.get(f"{domain}_cols")
+
+                # If a category has fewer than 3 features, we just use all of them
+                if not domain_cols:
+                    continue
+
+                # 1. Calculate absolute correlations of all raw features with the outcome
+                corrs = []
+                for col in domain_cols:
+                    r, p = stats.spearmanr(df[col].fillna(0), df[out])
+                    corrs.append((col, r, p))
+
+                # 2. Sort by absolute correlation, descending, and take Top 3
+                corrs.sort(key=lambda x: abs(x[1]), reverse=True)
+                top3_cols = [c[0] for c in corrs[:3]]
+
+                # 3. Re-run PCA on just these top 3 features
+                data = df[top3_cols].fillna(0)
+                pca = PCA(n_components=1, svd_solver='full', random_state=42)
+                pc1 = pca.fit_transform(data).flatten()
+
+                # Align PC1 direction with the strongest feature to ensure interpretability
+                strongest_col = top3_cols[0]
+                strongest_idx = top3_cols.index(strongest_col)
+                if pca.components_[0][strongest_idx] < 0:
+                    pc1 = -pc1
+
+                # 4. Correlate this new "Top3" index with the outcome
+                r_top3, p_top3 = stats.spearmanr(pc1, df[out])
+
+                scenario_res[f"{domain}_Top3_Features"] = " | ".join(top3_cols)
+                scenario_res[f"{domain}_Top3_r"] = round(r_top3, 3)
+                scenario_res[f"{domain}_Top3_p"] = round(p_top3, 4)
+
+            results.append(scenario_res)
+
+    df_top3 = pd.DataFrame(results)
+
+    # Save the file that the bar chart plotting function will read
+    csv_path = output_dir / "AppendixC_top3_sensitivity.csv"
+    df_top3.to_csv(csv_path, index=False)
+    log.info(f"Top 3 sensitivity analysis written to: {csv_path}")
+
+    return df_top3
+
+
+def plot_top3_bar_chart(csv_path, output_dir):
+    """
+    Generates a grouped bar chart for the Top 3 Sensitivity Analysis.
+    Color-corrected to perfectly match the raw vlag colors of information_scenarios.png.
+    """
+    # 1. Load the Top 3 Data
+    df = pd.read_csv(csv_path)
+
+    # 2. Reshape the data for seaborn (Melt)
+    df_melt = pd.melt(
+        df,
+        id_vars=['Scenario', 'Outcome'],
+        value_vars=['infra_Top3_r', 'visual_Top3_r', 'dynamic_Top3_r'],
+        var_name='Channel',
+        value_name='rho'
+    )
+
+    # Calculate absolute correlation strength
+    df_melt['abs_rho'] = df_melt['rho'].abs()
+
+    # Clean up legend labels
+    channel_map = {
+        'infra_Top3_r': 'Static Index (top 3 features)',
+        'visual_Top3_r': 'Visual Index (top 3 features)',
+        'dynamic_Top3_r': 'Dynamic Index (top 3 features)'
+    }
+    df_melt['Channel'] = df_melt['Channel'].map(channel_map)
+
+    # Exact labels for the X-axis
+    scenario_map = {
+        "Planner_View": "Static",
+        "Visual_Cyclist": "Visual",
+        "Temporal_Cyclist": "Temporal",
+        "Visual_Temporal_Cyclist": "Visual-Temporal\n(Integrated)"
+    }
+    df_melt['Scenario_Label'] = df_melt['Scenario'].map(scenario_map)
+
+    # 3. Exact Color Palette Sync
+    cmap = plt.get_cmap("vlag")
+    palette = {
+        'Static Index (top 3 features)': cmap(0.05),
+        'Visual Index (top 3 features)': '#95A5A6',
+        'Dynamic Index (top 3 features)': cmap(0.95)
+    }
+
+    # 4. Plotting Setup (Matching font styling)
+    sns.set_theme(style="whitegrid", font="sans-serif")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5), sharey=True)
+
+    outcomes = [('valence', axes[0]), ('arousal', axes[1])]
+
+    for outcome_val, ax in outcomes:
+        subset = df_melt[df_melt['Outcome'] == outcome_val]
+        bars = sns.barplot(
+            data=subset,
+            x='Scenario_Label',
+            y='abs_rho',
+            hue='Channel',
+            palette=palette,
+            saturation=1.0,
+            edgecolor='none',  # No borders
+            ax=ax
+        )
+
+        # Add exact values on top of bars
+        for p in ax.patches:
+            height = p.get_height()
+            if height > 0:
+                ax.annotate(f'{height:.2f}',
+                            (p.get_x() + p.get_width() / 2., height),
+                            ha='center', va='bottom',
+                            fontsize=11, color='black',
+                            xytext=(0, 4),
+                            textcoords='offset points')
+
+        # Updated, accurate titles
+        title_str = "Index correlation with Valence" if outcome_val == 'valence' else "Index correlation with Arousal"
+        ax.set_title(title_str, fontsize=14, pad=15)
+
+        ax.set_xlabel("Information Scenarios", fontsize=12, labelpad=10)
+
+        if ax == axes[0]:
+            ax.set_ylabel("Absolute Spearman correlation ($|\\rho|$)", fontsize=12)
+        else:
+            ax.set_ylabel("")
+
+        ax.set_ylim(0, 0.85)  # Leave room for annotations and legend
+        ax.tick_params(axis='x', labelsize=11)
+        ax.tick_params(axis='y', labelsize=11)
+
+        # Grid cleanup
+        ax.grid(axis='y', linestyle='--', alpha=0.5)
+        ax.grid(axis='x', visible=False)
+
+        # Legend placed INSIDE the first plot (Valence)
+        if ax == axes[0]:
+            ax.legend(title="", fontsize=11, loc='upper left', framealpha=0.9)
+        else:
+            ax.get_legend().remove()
+
+    plt.tight_layout()
+
+    out_path = Path(output_dir) / "top3_sensitivity_barchart.png"
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    print(f"Saved styled Top-3 bar chart to {out_path}")
+    plt.close()
+
+
+def extract_residual_cov(model, var1="valence", var2="arousal"):
+    """Pull the freed residual covariance/correlation between two endogenous vars."""
+    try:
+        ins = model.inspect(std_est=True)
+        row = ins[(ins["op"] == "~~") &
+                  (((ins["lval"] == var1) & (ins["rval"] == var2)) |
+                   ((ins["lval"] == var2) & (ins["rval"] == var1)))]
+        if row.empty:
+            return {}
+        r = row.iloc[0]
+        out = {"resid_cov": r["Estimate"]}
+        # std_est column holds the standardized estimate (≈ residual correlation)
+        for cand in ["Est. Std", "Std. Est.", "std_est"]:
+            if cand in row.columns:
+                out["resid_corr"] = r[cand]
+                break
+        return out
+    except Exception as e:
+        log.warning(f"Could not extract residual cov: {e}")
+        return {}
+
+
 # -------------------------------------------------------------------
 # MAIN PIPELINE
 # -------------------------------------------------------------------
+
+
 def main():
     # ============================================================
     # 0. LOAD RAW DATA
@@ -868,12 +1316,15 @@ def main():
         df_results,
         consent=False,
         duration=False,
-        location=False,
-        gender=False,
-        cycling_environment=False,
+        location=False
+    )
+
+    df_results = utils.processing_utils.aggregate_by_characteristics(
+        df_results,
         cycling_frequency=True,
         cycling_confidence=True
     )
+    log.info("Participant filtering and demographic aggregation complete.")
 
     # ============================================================
     # 2. MAP SUBJECTIVE RATINGS TO VIDEOS
@@ -913,6 +1364,7 @@ def main():
               .merge(df_ground, on=c.VIDEO_ID_COL, how="left")
               .merge(df_demo, on=c.PARTICIPANT_ID, how="left"))
 
+    # excluded due to poor physiology signal
     df_raw = df_raw[~df_raw[c.PARTICIPANT_ID].isin([0, 3, 12, 24])].copy()
 
     generate_descriptives(df_raw, output_dir)
@@ -935,6 +1387,7 @@ def main():
         "bus_lane_presence",
         "side_parking_count",
         "intersection_count",
+        "tram_lane_presence",
         "tree_canopy_share",
         "greenery_share_gis",
         "commercial_share",
@@ -1010,11 +1463,12 @@ def main():
         "bus_lane_presence": "Bus Lane Presence",
         "intersection_count": "Intersection Count",
         "tree_canopy_share": "Tree Canopy (%)",
+        "tram_lane_presence": "Tram Lane Presence",
         "greenery_share_gis": "Greenery Share (GIS)",
         "building_count": "Building Count",
         "car_lanes_total_count": "Car Lanes Count",
         "traffic_volume": "Traffic Volume (AADT)",
-        "motorized_traffic_speed_kmh": "Speed Limit",
+        "motorized_traffic_speed_kmh": "Traffic Speed (km/h)",
         # Visual
         "pois_count": "POIs Count",
         "average_greenery_share": "Greenery share (Seg.)",
@@ -1024,7 +1478,7 @@ def main():
         # Dynamic
         "ped_and_cycl_count": "Ped. & Cyclists Count",
         "motor_vehicle_overtakes_count": "Overtakes Count",
-        "unique_motor_vehicles_count": "Vehicles Count"
+        "unique_motor_vehicles_count": "Vehicles Count",
     }
 
     corr_cols = list(pretty_names.keys())
@@ -1042,50 +1496,59 @@ def main():
     # ============================================================
 
     # SCENARIOS
-    standardized_infra_cols = ["bike_infra_type_numeric", "bus_lane_presence", "intersection_count",
-                               "car_lanes_total_count"
-                               ]
+    static_infra_cols = ["bike_infra_type_numeric", "bus_lane_presence", "intersection_count", "car_lanes_total_count",
+                         "tram_lane_presence"]
+    static_visual_cols = ["greenery_share_gis", "building_count", "tree_canopy_share", "car_lanes_total_count"]
+    static_traffic_cols = ["traffic_volume", "motorized_traffic_speed_kmh", "pois_count"]
 
     SCENARIOS_CONFIG = {
         "Planner_View": {
-            "infra_cols": standardized_infra_cols,
+            "infra_cols": static_infra_cols,
             "infra_ref": "bike_infra_type_numeric",
-            "visual_cols": ["tree_canopy_share", "greenery_share_gis", "building_count", "pois_count"],
+            "visual_cols": static_visual_cols,
             "visual_ref": "greenery_share_gis",
-            "dynamic_cols": ["traffic_volume", "motorized_traffic_speed_kmh"],
+            "dynamic_cols": static_traffic_cols,
             "dynamic_ref": "traffic_volume"
         },
         "Visual_Cyclist": {
-            "infra_cols": standardized_infra_cols,
+            "infra_cols": static_infra_cols,
             "infra_ref": "bike_infra_type_numeric",
-            "visual_cols": ["average_greenery_share", "average_building_share", "average_sky_share",
+            "visual_cols": ["average_greenery_share",
+                            "average_building_share",
+                            "average_sky_share",
                             "average_road_share"],
             "visual_ref": "average_greenery_share",
-            "dynamic_cols": ["traffic_volume", "motorized_traffic_speed_kmh"],
+            "dynamic_cols": static_traffic_cols,
             "dynamic_ref": "traffic_volume"
         },
         "Temporal_Cyclist": {
-            "infra_cols": standardized_infra_cols,
+            "infra_cols": static_infra_cols,
             "infra_ref": "bike_infra_type_numeric",
-            "visual_cols": ["tree_canopy_share", "greenery_share_gis", "building_count", "pois_count"],
+            "visual_cols": static_visual_cols,
             "visual_ref": "greenery_share_gis",
-            "dynamic_cols": ["ped_and_cycl_count", "motor_vehicle_overtakes_count", "unique_motor_vehicles_count"],
+            "dynamic_cols": ["ped_and_cycl_count",
+                             "motor_vehicle_overtakes_count",
+                             "unique_motor_vehicles_count"],
             "dynamic_ref": "motor_vehicle_overtakes_count"
         },
         "Visual_Temporal_Cyclist": {
-            "infra_cols": standardized_infra_cols,
+            "infra_cols": static_infra_cols,
             "infra_ref": "bike_infra_type_numeric",
-            "visual_cols": ["average_greenery_share", "average_building_share", "average_sky_share",
+            "visual_cols": ["average_greenery_share",
+                            "average_building_share",
+                            "average_sky_share",
                             "average_road_share"],
             "visual_ref": "average_greenery_share",
-            "dynamic_cols": ["ped_and_cycl_count", "motor_vehicle_overtakes_count", "unique_motor_vehicles_count"],
+            "dynamic_cols": ["ped_and_cycl_count",
+                             "motor_vehicle_overtakes_count",
+                             "unique_motor_vehicles_count"],
             "dynamic_ref": "motor_vehicle_overtakes_count"
         }
     }
     # ============================================================
     # 8. INDEX CREATION (SIGN–ALIGNED)
     # ============================================================
-    log.info("--- Calculating Sign-Aligned Equal-Weighted Indices ---")
+    log.info("--- Calculating Sign-Aligned PCA Indices ---")
 
     index_loading_report = []
 
@@ -1116,14 +1579,10 @@ def main():
             {"Scenario": scenario_name, "Type": "Dynamic", "Var_PC1": var_dyn, "Loadings": load_dyn}
         )
 
-    # PPG: Invert HRV so it aligns with Arousal
-    ppg_signed_cols = []
-    for v in ppg_cols:
-        if v == "HRV_RMSSD":
-            df_raw[v + "_signed"] = df_raw[v] * -1
-        else:
-            df_raw[v + "_signed"] = df_raw[v]
-        ppg_signed_cols.append(v + "_signed")
+    # Z-score physiological metrics so the PCA composite is not scale-dominated
+    # (EDA is in µS, PPG in BPM/ms — without this the index reflects raw variance, not shared variance)
+    for col in eda_cols + ppg_cols:
+        df_raw[col] = zscore(df_raw[col].fillna(df_raw[col].mean()))
 
     # Create EDA Index via PCA
     df_raw["EDAIndex"], var_eda, load_eda = create_aligned_index(
@@ -1144,27 +1603,35 @@ def main():
     corr = df_raw[["EDAIndex", 'SCR_Peaks_N', "PPGIndex", 'PPG_Rate_Mean', "valence", "arousal"]].corr()
     corr.to_csv(output_dir / "physio_index_correlation_raw.csv")
 
+    # ============================================================
+    # 9. SENSITIVITY ANALYSES
+    # ============================================================
+
     # Save loadings and perform sensitivity analysis
     pd.DataFrame(index_loading_report).to_csv(output_dir / "index_loading_report.csv", index=False)
     run_sensitivity_analysis(df_raw, SCENARIOS_CONFIG, ["valence", "arousal"], output_dir)
 
-    df_raw['PPGIndex'] = df_raw['PPG_Rate_Mean']
-    df_raw['EDAIndex'] = df_raw['SCR_Peaks_N']
-    log.info("Saved PCA loading and sensitivity report")
+    # Task 1: Category-level baseline correlations (Heatmaps / Table 6)
+    generate_category_level_correlations(df_raw, SCENARIOS_CONFIG, output_dir)
 
-    # ============================================================
-    # Run MI for each domain and scenario
-    # ============================================================
+    # Task 2: Top-3 feature sensitivity analysis (Data Gen & Bar Chart)
+    run_top3_sensitivity_analysis(df_raw, SCENARIOS_CONFIG, ["valence", "arousal"], output_dir)
+    plot_top3_bar_chart(output_dir / "AppendixC_top3_sensitivity.csv", output_dir)
+
+    log.info("Saved PCA loading, Table 6, and Appendix C sensitivity reports.")
+
+    # --- MI validation check (not reported; personal diagnostic) ---
+    seen = set()
     for scenario_name, config in SCENARIOS_CONFIG.items():
-        log.info(f" Mutual Information: {scenario_name}")
-
         for domain in ["infra", "visual", "dynamic"]:
-            cols = config[f"{domain}_cols"]
-
-            MI_val, MI_ar = mutual_info(df_raw, cols)
-            log.info("\nMutual Information (Valence/Arousal):")
+            cols = tuple(config[f"{domain}_cols"])
+            if cols in seen:
+                continue
+            seen.add(cols)
+            MI_val, MI_ar = mutual_info(df_raw, list(cols))
+            log.info(f"MI [{scenario_name}/{domain}]:")
             for f, mv, ma in zip(cols, MI_val, MI_ar):
-                log.info(f"{f:30s} val={mv:.3f} ar={ma:.3f}")
+                log.info(f"  {f:30s} val={mv:.3f} ar={ma:.3f}")
 
     # ============================================================
     # 12. DEFINE MODEL CATALOG (Final & Complete)
@@ -1175,7 +1642,7 @@ def main():
         "04_Full_Environment": """
             valence ~ InfraIndex + VisualIndex + DynamicIndex
             arousal ~ InfraIndex + VisualIndex + DynamicIndex
-            
+
             valence ~~ arousal
             InfraIndex  ~~ VisualIndex + DynamicIndex
             VisualIndex ~~ DynamicIndex
@@ -1185,10 +1652,10 @@ def main():
         "05_Full_Mediation": """
             VisualIndex  ~ InfraIndex
             DynamicIndex ~ InfraIndex
-            
+
             valence      ~ VisualIndex + DynamicIndex
             arousal      ~ VisualIndex + DynamicIndex
-            
+
             valence ~~ arousal
             VisualIndex ~~ DynamicIndex
         """,
@@ -1207,7 +1674,7 @@ def main():
             # Env -> Body (Both Stress and Safety)
             PPGIndex    ~ InfraIndex + VisualIndex + DynamicIndex
             EDAIndex    ~ InfraIndex + VisualIndex + DynamicIndex
-           
+
             # Residual Correlations
             valence ~~ arousal
             PPGIndex ~~ EDAIndex
@@ -1292,17 +1759,8 @@ def main():
 
             # Residual covariances
             valence ~~ arousal
-        """,
-
-        "12_Combined_Interactions": """
-            valence ~ InfraIndex + VisualIndex + DynamicIndex + Infra_Dynamic_Interaction + Infra_Visual_Interaction
-            arousal ~ InfraIndex + VisualIndex + DynamicIndex + Infra_Dynamic_Interaction + Infra_Visual_Interaction
-
-            valence ~~ arousal
-            InfraIndex ~~ VisualIndex + DynamicIndex
-            VisualIndex ~~ DynamicIndex
         """
-        }
+    }
 
     # ============================================================
     # 13. EXECUTION LOOP (With Full Fit Metrics)
@@ -1365,6 +1823,8 @@ def main():
 
                 # Run the VIF check function
                 vif_df = check_vif(df_model, predictors)
+                interaction_term = predictors[-1]
+                vif_interaction = vif_df.loc[vif_df["feature"] == interaction_term, "VIF"]
                 max_vif = vif_df["VIF"].max()
 
                 if max_vif > 5:
@@ -1378,6 +1838,10 @@ def main():
                     "Model": model_name
                 }
 
+                if "Mod" in model_name:
+                    res["VIF_max"] = max_vif
+                    res["VIF_interaction"] = float(vif_interaction.iloc[0]) if len(vif_interaction) else None
+
                 for m in FIT_METRICS:
                     res[m] = fit_stats[m].iloc[0]
 
@@ -1388,6 +1852,8 @@ def main():
                 # Extract Physiology R2 (returns None if variable is not in model)
                 res["R2_PPG"] = r2_data.get("PPGIndex", None)
                 res["R2_EDA"] = r2_data.get("EDAIndex", None)
+
+                res.update(extract_residual_cov(model, "valence", "arousal"))
 
                 # --- WALD TESTS FOR INTERACTION MODELS ONLY ---
                 if model_name.startswith(("09_", "10_", "11_")):
@@ -1413,6 +1879,26 @@ def main():
     log.info("SEM modeling complete. Check output directory for results.")
 
     plot_explained_variance(output_dir)
+
+    '''
+    # ---- Cluster-bootstrap inference for headline models ----
+    log.info("--- Cluster bootstrap (clustered on video) ---")
+    BOOTSTRAP_TARGETS = {
+        "Visual_Temporal_Cyclist": ["04_Full_Environment", "09_Mod_Infra_Buffers_Traffic"],
+        "Planner_View": ["04_Full_Environment"],
+    }
+    for scen, models in BOOTSTRAP_TARGETS.items():
+        for mname in models:
+            summ, _ = cluster_bootstrap_sem(
+                df_raw, scen, SCENARIOS_CONFIG[scen], MODEL_CATALOG[mname],
+                cluster_col=c.VIDEO_ID_COL, id_col=c.PARTICIPANT_ID, n_boot=2000)
+            summ.to_csv(output_dir / f"bootstrap_{scen}_{mname}.csv")
+            log.info(f"Saved bootstrap_{scen}_{mname}.csv")
+
+    # ---- Video-aggregated robustness check (N≈42) ----
+    run_video_aggregated_sem(df_raw, SCENARIOS_CONFIG, MODEL_CATALOG,
+                             c.VIDEO_ID_COL, output_dir)
+    '''
 
 
 if __name__ == "__main__":
