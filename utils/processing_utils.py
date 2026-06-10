@@ -157,8 +157,8 @@ def aggregate_by_characteristics(
         frequency_lookup = {
             "Never": "Infrequent",
             "Less than once a month": "Infrequent",
-            "1-3 times/month": "Infrequent",
-            "1-2 days/week": "Frequent",
+            "1-3 times/month": "Occasional",
+            "1-2 days/week": "Occasional",
             "3-4 days/week": "Frequent",
             "5-6 days/week": "Frequent",
             "Every day": "Frequent"
@@ -307,7 +307,8 @@ def add_valence_arousal(
 
 def calculate_video_level_scores(
         long_df: pd.DataFrame,
-        output_path: Optional[Union[str, Path]] = None
+        output_path: Optional[Union[str, Path]] = None,
+        lab_bool: bool = False
 ) -> pd.DataFrame:
     """
     Video-level descriptive affect metrics (RQ1) + Structural Disagreement (RQ2).
@@ -315,266 +316,286 @@ def calculate_video_level_scores(
     """
     results = []
 
-    # --- 1. SETUP GLOBAL POOL FOR DISTINCTIVENESS METRIC ---
-    global_affect = long_df[[c.VALENCE, c.AROUSAL]].dropna().to_numpy(float)
+    if not lab_bool:
+        # --- 1. SETUP GLOBAL POOL FOR DISTINCTIVENESS METRIC ---
+        global_affect = long_df[[c.VALENCE, c.AROUSAL]].dropna().to_numpy(float)
 
-    # Subsample if too large (>5000) to speed up distance matrix calculation
-    if len(global_affect) > 5000:
-        rng = np.random.default_rng(42)
-        global_sample = rng.choice(global_affect, size=5000, replace=False)
-    else:
-        global_sample = global_affect
-
-    # Calculate internal energy of the global pool (d_yy) ONCE.
-    d_yy = cdist(global_sample, global_sample, metric='euclidean').mean()
-
-    state_cols = [f"{s}_count" for s in c.AFFECTIVE_STATES]
-    grouped = long_df.groupby(c.VIDEO_ID_COL, sort=True, dropna=True)
-
-    for video_id, video_df in grouped:
-        video_affect = video_df[[c.VALENCE, c.AROUSAL]].dropna()
-        n_ratings = len(video_affect)
-
-        if n_ratings == 0:
-            continue
-
-        valence_values = video_affect[c.VALENCE].to_numpy(float)
-        arousal_values = video_affect[c.AROUSAL].to_numpy(float)
-        affect_points = np.column_stack([valence_values, arousal_values])
-
-        # -------------------------------------------------
-        # OE: convert ordered labels
-        # -------------------------------------------------
-        oe_num = pd.Categorical(
-            video_df[c.OE], categories=c.OE_ORDER, ordered=True
-        ).codes.astype(float)
-        oe_num[oe_num < 0] = np.nan
-        oe_mean = float(np.nanmean(oe_num))
-        oe_mode = (
-            video_df[c.OE]
-            .value_counts()
-            .reindex(c.OE_ORDER, fill_value=0)
-            .idxmax()
-        )
-
-        # -------------------------------------------------
-        # affect_state counts + entropy
-        # -------------------------------------------------
-        state_vc = (
-            video_df[c.AFFECT_STATE]
-            .value_counts()
-            .reindex(c.AFFECTIVE_STATES, fill_value=0)
-        )
-        state_counts = state_vc.tolist()
-        dominant_quadrant = state_vc.idxmax()
-
-        total = float(state_vc.sum())
-        if total > 0:
-            p = (state_vc / total).to_numpy(float)
-            p = p[p > 0]
-            affect_state_entropy = round(float(-(p * np.log(p)).sum()), 2)
+        # Subsample if too large (>5000) to speed up distance matrix calculation
+        if len(global_affect) > 5000:
+            rng = np.random.default_rng(42)
+            global_sample = rng.choice(global_affect, size=5000, replace=False)
         else:
-            affect_state_entropy = np.nan
+            global_sample = global_affect
 
-        # -------------------------------------------------
-        # per-dimension distribution summaries
-        # -------------------------------------------------
-        valence_mean = float(np.mean(valence_values))
-        arousal_mean = float(np.mean(arousal_values))
+        # Calculate internal energy of the global pool (d_yy) ONCE.
+        d_yy = cdist(global_sample, global_sample, metric='euclidean').mean()
 
-        valence_sd = round(float(np.std(valence_values, ddof=1)), 2) if n_ratings > 1 else np.nan
-        arousal_sd = round(float(np.std(arousal_values, ddof=1)), 2) if n_ratings > 1 else np.nan
+        state_cols = [f"{s}_count" for s in c.AFFECTIVE_STATES]
+        grouped = long_df.groupby(c.VIDEO_ID_COL, sort=True, dropna=True)
 
-        valence_skew = round(float(pd.Series(valence_values).skew()), 2) if n_ratings >= 3 else np.nan
-        arousal_skew = round(float(pd.Series(arousal_values).skew()), 2) if n_ratings >= 3 else np.nan
+        for video_id, video_df in grouped:
+            video_affect = video_df[[c.VALENCE, c.AROUSAL]].dropna()
+            n_ratings = len(video_affect)
 
-        # -------------------------------------------------
-        # dispersion: mean distance to centroid
-        # -------------------------------------------------
-        dev = affect_points - np.array([valence_mean, arousal_mean])
-        distances = np.linalg.norm(dev, axis=1)
-        dispersion_mean_distance = float(distances.mean())
+            if n_ratings == 0:
+                continue
 
-        if n_ratings >= 2:
-            # Pairwise Euclidean distances over all i<j (length n(n-1)/2)
-            pw = pdist(affect_points, metric="euclidean")
-            pairwise_mean_distance = float(pw.mean())
+            valence_values = video_affect[c.VALENCE].to_numpy(float)
+            arousal_values = video_affect[c.AROUSAL].to_numpy(float)
+            affect_points = np.column_stack([valence_values, arousal_values])
 
-            # RMS pairwise distance (sqrt of mean squared pairwise distance)
-            pw2 = pw ** 2
-            pairwise_mean_sq_distance = float(pw2.mean())
-            pairwise_rms_distance = float(np.sqrt(pairwise_mean_sq_distance))
-        else:
-            pairwise_mean_distance = np.nan
-            pairwise_mean_sq_distance = np.nan
-            pairwise_rms_distance = np.nan
-
-        # A. Anisotropy (Structure of Disagreement)
-        if n_ratings > 1:
-            cov_matrix = np.cov(affect_points.T)
-            # Use eigh because the covariance matrix is symmetric
-            eigenvalues = np.linalg.eigvalsh(cov_matrix)
-            l1, l2 = np.sort(eigenvalues)[::-1]
-            # AI ranges from 0 (isotropic/circle) to 1 (linear)
-            anisotropy_index = (l1 - l2) / (l1 + l2 + 1e-9)
-        else:
-            anisotropy_index = 0.0
-
-        # -------------------------------------------------
-        # 4. Polarization Index (Structural Bimodality)
-        # -------------------------------------------------
-        polarization_index = 0.0
-
-        MIN_SEPARATION = 0.5
-        BIC_MARGIN = 6.0  # 2-comp must beat 1-comp by >2.0 bits
-        MIN_N = 15
-
-        if n_ratings >= MIN_N:
-            try:
-                # 1. Fit 1-Component Model (Baseline)
-                gmm1 = GaussianMixture(n_components=1, n_init=10, random_state=42,
-                                       reg_covar=1e-4).fit(affect_points)
-                bic1 = gmm1.bic(affect_points)
-
-                # 2. Fit 2-Component Model (Bimodal Hypothesis)
-                gmm2 = GaussianMixture(n_components=2, n_init=10, random_state=42,
-                                       reg_covar=1e-4).fit(affect_points)
-                bic2 = gmm2.bic(affect_points)
-
-                # Calculate metrics
-                delta_bic = bic1 - bic2
-                mu1 = gmm2.means_[0]
-                mu2 = gmm2.means_[1]
-                dist = np.linalg.norm(mu1 - mu2)
-
-                polarization_index = float(dist)
-
-                # 3. Robust Decision Logic - ONLY assign if thresholds pass
-                #if delta_bic >= BIC_MARGIN and dist >= MIN_SEPARATION:
-                #    polarization_index = float(dist)
-                #else:
-                #    polarization_index = 0.0
-
-            except Exception as e:
-                log.warning(f"Video {video_id}: GMM fitting failed - {e}")
-                polarization_index = np.nan
-                delta_bic = np.nan
-        else:
-            # Not enough data
-            polarization_index = np.nan
-
-        # C. Distinctiveness Metric (Energy Statistic)
-        # A simpler implementation of earth mover's distance.
-        if n_ratings >= 5:
-            d_xy = cdist(affect_points, global_sample, metric='euclidean').mean()
-            d_xx = cdist(affect_points, affect_points, metric='euclidean').mean()
-            dist_distinctiveness = 2 * d_xy - d_xx - d_yy
-        else:
-            dist_distinctiveness = np.nan
-
-        # -------------------------------------------------
-        # covariance matrix elements
-        # -------------------------------------------------
-        if n_ratings > 1:
-            cov_mat = np.cov(affect_points.T, ddof=1)
-            var_valence = float(cov_mat[0, 0])
-            var_arousal = float(cov_mat[1, 1])
-            cov_valence_arousal = float(cov_mat[0, 1])
-            cov_trace = var_valence + var_arousal
-
-            valence_arousal_pearson_r = float(
-                np.corrcoef(valence_values, arousal_values)[0, 1]
-            )
-            dispersion_area_cov = round(float(np.linalg.det(cov_mat)), 6)
-        else:
-            var_valence, var_arousal = np.nan, np.nan
-            cov_valence_arousal, cov_trace = np.nan, np.nan
-            valence_arousal_pearson_r, dispersion_area_cov = np.nan, np.nan
-
-        # -------------------------------------------------
-        # Correlations (for sanity checks)
-        # -------------------------------------------------
-        va_rho = np.nan
-        if n_ratings >= 3:
-            va_rho, _ = spearmanr(valence_values, arousal_values)
-
-        valence_oe_rho, arousal_oe_rho = np.nan, np.nan
-        corr_df = video_df[[c.VALENCE, c.AROUSAL, c.OE]].dropna()
-        if len(corr_df) >= 3:
-            corr_oe_num = pd.Categorical(
-                corr_df[c.OE], categories=c.OE_ORDER, ordered=True
+            # -------------------------------------------------
+            # OE: convert ordered labels
+            # -------------------------------------------------
+            oe_num = pd.Categorical(
+                video_df[c.OE], categories=c.OE_ORDER, ordered=True
             ).codes.astype(float)
-            corr_oe_num[corr_oe_num < 0] = np.nan
+            oe_num[oe_num < 0] = np.nan
+            oe_mean = float(np.nanmean(oe_num))
+            oe_mode = (
+                video_df[c.OE]
+                .value_counts()
+                .reindex(c.OE_ORDER, fill_value=0)
+                .idxmax()
+            )
 
-            if np.isfinite(corr_oe_num).sum() >= 3:
-                valence_oe_rho, _ = spearmanr(corr_df[c.VALENCE].to_numpy(float), corr_oe_num)
-                arousal_oe_rho, _ = spearmanr(corr_df[c.AROUSAL].to_numpy(float), corr_oe_num)
+            # -------------------------------------------------
+            # affect_state counts + entropy
+            # -------------------------------------------------
+            state_vc = (
+                video_df[c.AFFECT_STATE]
+                .value_counts()
+                .reindex(c.AFFECTIVE_STATES, fill_value=0)
+            )
+            state_counts = state_vc.tolist()
+            dominant_quadrant = state_vc.idxmax()
 
-        results.append([
-            video_id,
-            round(valence_mean, 2),
-            round(valence_sd, 2),
-            round(valence_skew, 2),
-            round(arousal_mean, 2),
-            round(arousal_sd, 2),
-            round(arousal_skew, 2),
-            round(var_valence, 2),
-            round(var_arousal, 2),
-            round(cov_valence_arousal, 2),
-            round(cov_trace, 2),
-            round(polarization_index, 2),
-            round(delta_bic, 2),
-            round(dist_distinctiveness, 2),
-            round(anisotropy_index, 2),
-            round(valence_arousal_pearson_r, 2),
-            round(dispersion_mean_distance, 2),
-            round(pairwise_mean_distance, 2),
-            round(pairwise_rms_distance, 2),
-            round(pairwise_mean_sq_distance, 6),
-            round(dispersion_area_cov, 2),
-            round(va_rho, 2),
-            round(oe_mean, 2),
-            oe_mode,
-            round(valence_oe_rho, 2),
-            round(arousal_oe_rho, 2),
-            round(affect_state_entropy, 2),
-            dominant_quadrant,
-            *state_counts
-        ])
+            total = float(state_vc.sum())
+            if total > 0:
+                p = (state_vc / total).to_numpy(float)
+                p = p[p > 0]
+                affect_state_entropy = round(float(-(p * np.log(p)).sum()), 2)
+            else:
+                affect_state_entropy = np.nan
 
-    cols = [
-        c.VIDEO_ID_COL,
-        "valence_mean",
-        "valence_sd",
-        "valence_skewness",
-        "arousal_mean",
-        "arousal_sd",
-        "arousal_skewness",
-        "valence_variance",
-        "arousal_variance",
-        "valence_arousal_covariance",
-        "covariance_trace",
-        "polarization_index",
-        "delta_bic",
-        "dist_distinctiveness",
-        "anisotropy_index",
-        "valence_arousal_pearson_r",
-        "dispersion_mean_distance",
-        "pairwise_mean_distance",
-        "pairwise_rms_distance",
-        "pairwise_mean_sq_distance",
-        "dispersion_area_covariance",
-        "valence_arousal_spearman_rho",
-        "oe_mean",
-        "oe_mode",
-        "valence_oe_spearman_rho",
-        "arousal_oe_spearman_rho",
-        "affect_state_entropy",
-        "dominant_quadrant",
-        *state_cols
-    ]
+            # -------------------------------------------------
+            # per-dimension distribution summaries
+            # -------------------------------------------------
+            valence_mean = float(np.mean(valence_values))
+            arousal_mean = float(np.mean(arousal_values))
 
-    results = pd.DataFrame(results, columns=cols)
+            valence_sd = round(float(np.std(valence_values, ddof=1)), 2) if n_ratings > 1 else np.nan
+            arousal_sd = round(float(np.std(arousal_values, ddof=1)), 2) if n_ratings > 1 else np.nan
+
+            valence_skew = round(float(pd.Series(valence_values).skew()), 2) if n_ratings >= 3 else np.nan
+            arousal_skew = round(float(pd.Series(arousal_values).skew()), 2) if n_ratings >= 3 else np.nan
+
+            # -------------------------------------------------
+            # dispersion: mean distance to centroid
+            # -------------------------------------------------
+            dev = affect_points - np.array([valence_mean, arousal_mean])
+            distances = np.linalg.norm(dev, axis=1)
+            dispersion_mean_distance = float(distances.mean())
+
+            if n_ratings >= 2:
+                # Pairwise Euclidean distances over all i<j (length n(n-1)/2)
+                pw = pdist(affect_points, metric="euclidean")
+                pairwise_mean_distance = float(pw.mean())
+
+                # RMS pairwise distance (sqrt of mean squared pairwise distance)
+                pw2 = pw ** 2
+                pairwise_mean_sq_distance = float(pw2.mean())
+                pairwise_rms_distance = float(np.sqrt(pairwise_mean_sq_distance))
+            else:
+                pairwise_mean_distance = np.nan
+                pairwise_mean_sq_distance = np.nan
+                pairwise_rms_distance = np.nan
+
+            # A. Anisotropy (Structure of Disagreement)
+            if n_ratings > 1:
+                cov_matrix = np.cov(affect_points.T)
+                # Use eigh because the covariance matrix is symmetric
+                eigenvalues = np.linalg.eigvalsh(cov_matrix)
+                l1, l2 = np.sort(eigenvalues)[::-1]
+                # AI ranges from 0 (isotropic/circle) to 1 (linear)
+                anisotropy_index = (l1 - l2) / (l1 + l2 + 1e-9)
+            else:
+                anisotropy_index = 0.0
+
+            # -------------------------------------------------
+            # 4. Polarization Index (Structural Bimodality)
+            # -------------------------------------------------
+            MIN_SEPARATION = 0.5
+            BIC_MARGIN = 6.0  # 2-comp must beat 1-comp by >2.0 bits
+            MIN_N = 15
+
+            if n_ratings >= MIN_N:
+                try:
+                    # 1. Fit 1-Component Model (Baseline)
+                    gmm1 = GaussianMixture(n_components=1, n_init=10, random_state=42,
+                                       reg_covar=1e-4).fit(affect_points)
+                    bic1 = gmm1.bic(affect_points)
+
+                    # 2. Fit 2-Component Model (Bimodal Hypothesis)
+                    gmm2 = GaussianMixture(n_components=2, n_init=10, random_state=42,
+                                       reg_covar=1e-4).fit(affect_points)
+                    bic2 = gmm2.bic(affect_points)
+
+                    # Calculate metrics
+                    delta_bic = bic1 - bic2
+                    mu1 = gmm2.means_[0]
+                    mu2 = gmm2.means_[1]
+                    dist = np.linalg.norm(mu1 - mu2)
+
+                    # 3. Robust Decision Logic - ONLY assign if thresholds pass
+                    if delta_bic >= BIC_MARGIN and dist >= MIN_SEPARATION:
+                        polarization_index = float(dist)
+                    else:
+                        polarization_index = 0.0
+
+                except Exception as e:
+                    log.warning(f"Video {video_id}: GMM fitting failed - {e}")
+                    polarization_index = np.nan
+                    delta_bic = np.nan
+            else:
+                # Not enough data
+                polarization_index = np.nan
+
+            # C. Distinctiveness Metric (Energy Statistic)
+            # A simpler implementation of earth mover's distance.
+            if n_ratings >= 5:
+                d_xy = cdist(affect_points, global_sample, metric='euclidean').mean()
+                d_xx = cdist(affect_points, affect_points, metric='euclidean').mean()
+                dist_distinctiveness = 2 * d_xy - d_xx - d_yy
+            else:
+                dist_distinctiveness = np.nan
+
+            # -------------------------------------------------
+            # covariance matrix elements
+            # -------------------------------------------------
+            if n_ratings > 1:
+                cov_mat = np.cov(affect_points.T, ddof=1)
+                var_valence = float(cov_mat[0, 0])
+                var_arousal = float(cov_mat[1, 1])
+                cov_valence_arousal = float(cov_mat[0, 1])
+                cov_trace = var_valence + var_arousal
+
+                valence_arousal_pearson_r = float(
+                    np.corrcoef(valence_values, arousal_values)[0, 1]
+                )
+                dispersion_area_cov = round(float(np.linalg.det(cov_mat)), 6)
+            else:
+                var_valence, var_arousal = np.nan, np.nan
+                cov_valence_arousal, cov_trace = np.nan, np.nan
+                valence_arousal_pearson_r, dispersion_area_cov = np.nan, np.nan
+
+            # -------------------------------------------------
+            # Correlations (for sanity checks)
+            # -------------------------------------------------
+            va_rho = np.nan
+            if n_ratings >= 3:
+                va_rho, _ = spearmanr(valence_values, arousal_values)
+
+            valence_oe_rho, arousal_oe_rho = np.nan, np.nan
+            corr_df = video_df[[c.VALENCE, c.AROUSAL, c.OE]].dropna()
+            if len(corr_df) >= 3:
+                corr_oe_num = pd.Categorical(
+                    corr_df[c.OE], categories=c.OE_ORDER, ordered=True
+                ).codes.astype(float)
+                corr_oe_num[corr_oe_num < 0] = np.nan
+
+                if np.isfinite(corr_oe_num).sum() >= 3:
+                    valence_oe_rho, _ = spearmanr(corr_df[c.VALENCE].to_numpy(float), corr_oe_num)
+                    arousal_oe_rho, _ = spearmanr(corr_df[c.AROUSAL].to_numpy(float), corr_oe_num)
+
+            results.append([
+                video_id,
+                round(valence_mean, 2),
+                round(valence_sd, 2),
+                round(valence_skew, 2),
+                round(arousal_mean, 2),
+                round(arousal_sd, 2),
+                round(arousal_skew, 2),
+                round(var_valence, 2),
+                round(var_arousal, 2),
+                round(cov_valence_arousal, 2),
+                round(cov_trace, 2),
+                round(polarization_index, 2),
+                round(delta_bic, 2),
+                round(dist_distinctiveness, 2),
+                round(anisotropy_index, 2),
+                round(valence_arousal_pearson_r, 2),
+                round(dispersion_mean_distance, 2),
+                round(pairwise_mean_distance, 2),
+                round(pairwise_rms_distance, 2),
+                round(pairwise_mean_sq_distance, 6),
+                round(dispersion_area_cov, 2),
+                round(va_rho, 2),
+                round(oe_mean, 2),
+                oe_mode,
+                round(valence_oe_rho, 2),
+                round(arousal_oe_rho, 2),
+                round(affect_state_entropy, 2),
+                dominant_quadrant,
+                *state_counts
+            ])
+
+        cols = [
+            c.VIDEO_ID_COL,
+            "valence_mean",
+            "valence_sd",
+            "valence_skewness",
+            "arousal_mean",
+            "arousal_sd",
+            "arousal_skewness",
+            "valence_variance",
+            "arousal_variance",
+            "valence_arousal_covariance",
+            "covariance_trace",
+            "polarization_index",
+            "delta_bic",
+            "dist_distinctiveness",
+            "anisotropy_index",
+            "valence_arousal_pearson_r",
+            "dispersion_mean_distance",
+            "pairwise_mean_distance",
+            "pairwise_rms_distance",
+            "pairwise_mean_sq_distance",
+            "dispersion_area_covariance",
+            "valence_arousal_spearman_rho",
+            "oe_mean",
+            "oe_mode",
+            "valence_oe_spearman_rho",
+            "arousal_oe_spearman_rho",
+            "affect_state_entropy",
+            "dominant_quadrant",
+            *state_cols
+        ]
+
+        results = pd.DataFrame(results, columns=cols)
+    else:
+        grouped = long_df.groupby(c.VIDEO_ID_COL, sort=True, dropna=True)
+        for video_id, video_df in grouped:
+            video_affect = video_df[[c.VALENCE, c.AROUSAL]].dropna()
+            n_ratings = len(video_affect)
+
+            if n_ratings == 0:
+                continue
+
+            valence_values = video_affect[c.VALENCE].to_numpy(float)
+            arousal_values = video_affect[c.AROUSAL].to_numpy(float)
+            valence_mean = float(np.mean(valence_values))
+            arousal_mean = float(np.mean(arousal_values))
+
+            results.append([
+                video_id,
+                round(valence_mean, 2),
+                round(arousal_mean, 2)])
+            cols = [
+                c.VIDEO_ID_COL,
+                "valence",
+                "arousal"]
+        results = pd.DataFrame(results, columns=cols)
 
     if output_path is not None:
         results.to_csv(output_path, index=False)
@@ -1432,6 +1453,24 @@ def prepare_categorical_predictors(df: pd.DataFrame, ordinal_map: dict) -> pd.Da
     return df_out
 
 
+def _offtype_clip_id(row, pos_col="spoiler_position"):
+    """
+    Video id of the off-type (spoiler) segment, or 'baseline' for homogeneous routes.
+    spoiler_position is 1-indexed (1..3); 0 means no spoiler (baseline).
+    Reads from pos1_video_id / pos2_video_id / pos3_video_id.
+    """
+    try:
+        pos = int(row[pos_col])
+    except (TypeError, ValueError):
+        return "baseline"
+    if pos == 0:
+        return "baseline"
+    vid = row.get(f"pos{pos}_video_id")
+    if pd.isna(vid):
+        return "baseline"
+    return f"clip_{int(vid)}"
+
+
 def prepare_combined_scenario_df(
         df_positive: pd.DataFrame,
         df_negative: pd.DataFrame
@@ -1460,5 +1499,11 @@ def prepare_combined_scenario_df(
 
     # Add the quantity of spoilers in the sequence. Counting B would result in the same but inverse reults.
     df_combined['NB_count'] = df_combined['sequence_list'].apply(lambda seq: seq.count('NB'))
+
+    # --- Off-type (spoiler) clip id for the crossed random effect (Stage 4) ---
+    df_combined["spoiler_clip"] = df_combined.apply(_offtype_clip_id, axis=1)
+    df_combined["spoiler_clip"] = df_combined["spoiler_clip"].astype("category")
+
+    df_combined = df_combined.reset_index(drop=True)
 
     return df_combined
