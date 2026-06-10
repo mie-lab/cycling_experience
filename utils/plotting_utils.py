@@ -1,10 +1,10 @@
+from __future__ import annotations
 from scipy.spatial import ConvexHull
 from matplotlib.patches import Patch
 import matplotlib.patches as mpatches
 from collections import Counter
 from PIL import Image
 from typing import Any, Optional, Sequence, Tuple, Dict, List, Union
-import seaborn as sns
 import matplotlib as mpl
 import re
 from matplotlib.lines import Line2D
@@ -12,13 +12,17 @@ import constants as c
 import scipy.stats as stats
 from scipy.stats import ttest_ind
 from pathlib import Path
-import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from adjustText import adjust_text
 import matplotlib.colors as mcolors
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from matplotlib.patches import Patch
+import matplotlib.colors as mcolors
+import textwrap
 
 
 # ---  Plotting functions for survey data analysis ---
@@ -1888,7 +1892,7 @@ def plot_candidate_predictions(
 
 def plot_violin_panels(
         df: pd.DataFrame,
-        sequence_order: Optional[list] = None, # MODIFIED: New parameter
+        sequence_order: Optional[list] = None, #
         palette_name="Set1",
         mean_marker_size=40,
         save_path: Optional[Path] = None
@@ -1948,6 +1952,266 @@ def plot_violin_panels(
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+
+from pathlib import Path
+from typing import Optional, Sequence, Tuple
+import pandas as pd
+
+
+def plot_violin_trend_panels(
+    df: pd.DataFrame,
+    scenario: str,
+    sequence_order: Optional[list[str]] = None,
+    metrics: Sequence[Tuple[str, Tuple[float, float], str]] = (
+        ("valence", (-1, 1), "Valence"),
+        ("arousal", (-1, 1), "Arousal"),
+    ),
+    estimator: str = "mean",          # "mean" or "median"
+    palette_name: str = "Set2",
+    jitter: float = 0.22,
+    raw_alpha: float = 0.30,
+    raw_size: float = 25,             # scatter size (points^2)
+    violin_lw: float = 1.0,
+    trend_color: str = "0.45",        # grey
+    trend_lw: float = 1.7,
+    trend_ls: str = "--",
+    summary_ms: float = 9,            # marker size (points)
+    save_path: Optional[Path] = None,
+) -> None:
+    d = df.copy()
+    d["sequence_type"] = d["sequence_list"].apply(lambda s: " → ".join(map(str, s)))
+
+    order = (
+        [s for s in sequence_order if s in set(d["sequence_type"].dropna().unique())]
+        if sequence_order else sorted(d["sequence_type"].dropna().unique())
+    )
+    x = np.arange(len(order))
+    pal = dict(zip(order, sns.color_palette(palette_name, len(order))))
+    est_fn = np.median if estimator == "median" else np.mean
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=(5.5 * len(metrics), 5.5), sharex=True)
+    axes = np.atleast_1d(axes)
+
+    rng = np.random.default_rng(42)
+
+    for ax, (m, ylim, title) in zip(axes, metrics):
+        dd = d[["sequence_type", m]].dropna()
+        dd = dd[dd["sequence_type"].isin(order)]
+
+        # --- 1) outline-only violins (no fill)
+        sns.violinplot(
+            data=dd, x="sequence_type", y=m, order=order,
+            palette=[pal[s] for s in order],
+            cut=0, inner=None, linewidth=violin_lw, ax=ax
+        )
+        # remove fill => make faces transparent, keep colored edges
+        for i, coll in enumerate(ax.collections[:len(order)]):
+            coll.set_facecolor((0, 0, 0, 0))     # transparent fill
+            coll.set_edgecolor(pal[order[i]])    # colored outline
+            coll.set_linewidth(violin_lw)
+
+        # --- 2) raw points, colored by sequence (honest jitter in x only)
+        for i, seq in enumerate(order):
+            y = dd.loc[dd["sequence_type"] == seq, m].to_numpy(dtype=float)
+            xj = x[i] + rng.uniform(-jitter, jitter, size=y.size)
+            ax.scatter(xj, y, s=raw_size, color=pal[seq], alpha=raw_alpha, edgecolors="none", zorder=2)
+
+        # --- 3) summary (mean/median) + dashed trend line
+        centers = np.array([est_fn(dd.loc[dd["sequence_type"] == s, m].to_numpy()) for s in order], float)
+        ax.plot(x, centers, linestyle=trend_ls, color=trend_color, lw=trend_lw, zorder=3)
+
+        # summary marker: white dot + black edge + colored ring
+        ax.plot(x, centers, "o", ms=summary_ms, mfc="white", mec="black", mew=1.2, zorder=4)
+        ax.scatter(x, centers, s=(summary_ms * 18), facecolors="none",
+                   edgecolors=[pal[s] for s in order], linewidths=2.2, zorder=5)
+
+        ax.set_title(title)
+        ax.set_xlabel("Sequence scenario")
+        ax.set_ylabel(title)
+        ax.set_ylim(*ylim)
+        ax.set_xticks(x)
+        ax.set_xticklabels(order, ha="right")
+        ax.grid(True, axis="y", alpha=0.25)
+
+    fig.suptitle(f"{scenario} Scenario", fontsize=16, y=1.02)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=250, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+from pathlib import Path
+from typing import Optional, Sequence, Tuple
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+def plot_sequence_trend_panels(
+    df: pd.DataFrame,
+    sequence_order: Optional[list[str]] = None,
+    metrics: Sequence[Tuple[str, Tuple[float, float], str]] = (
+        ("valence", (-1, 1), "Valence"),
+        ("arousal", (-1, 1), "Arousal"),
+    ),
+    estimator: str = "median",   # "mean" or "median"
+    ci: int = 95,
+    n_boot: int = 2000,
+    seed: int = 42,
+    palette_name: str = "Set2",
+    raw_alpha: float = 0.35,
+    raw_size: float = 22,        # scatter size (points^2)
+    jitter: float = 0.22,        # horizontal jitter only (honest)
+    line_color: str = "0.45",    # grey
+    line_width: float = 1.6,
+    save_path: Optional[Path] = None,
+) -> None:
+    d = df.copy()
+    d["sequence_type"] = d["sequence_list"].apply(lambda s: " → ".join(map(str, s)))
+    rng = np.random.default_rng(seed)
+
+    order = (
+        [s for s in sequence_order if s in set(d["sequence_type"].dropna().unique())]
+        if sequence_order else sorted(d["sequence_type"].dropna().unique())
+    )
+    palette = dict(zip(order, sns.color_palette(palette_name, len(order))))
+
+    est_fn = np.median if estimator == "median" else np.mean
+    lo_q, hi_q = (100 - ci) / 2, 100 - (100 - ci) / 2
+
+    def boot_ci(x: np.ndarray) -> tuple[float, float, float]:
+        x = np.asarray(x, float)
+        x = x[np.isfinite(x)]
+        if x.size == 0:
+            return np.nan, np.nan, np.nan
+        c = float(est_fn(x))
+        if x.size == 1:
+            return c, c, c
+        idx = rng.integers(0, x.size, size=(n_boot, x.size))
+        boots = np.apply_along_axis(est_fn, 1, x[idx])
+        lo, hi = np.percentile(boots, [lo_q, hi_q])
+        return c, float(lo), float(hi)
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6.6 * len(metrics), 5.2), sharex=True)
+    axes = np.atleast_1d(axes)
+
+    x = np.arange(len(order))
+
+    for ax, (m, ylim, title) in zip(axes, metrics):
+        dd = d[["sequence_type", m]].dropna()
+        dd = dd[dd["sequence_type"].isin(order)]
+
+        # raw points (colored by sequence) — matplotlib scatter is leaner than seaborn here
+        for i, seq in enumerate(order):
+            y = dd.loc[dd["sequence_type"] == seq, m].to_numpy(dtype=float)
+            xj = x[i] + rng.uniform(-jitter, jitter, size=y.size)
+            ax.scatter(xj, y, s=raw_size, color=palette[seq], alpha=raw_alpha, edgecolors="none", zorder=1)
+
+        # summary + CI
+        centers, lows, highs = [], [], []
+        for seq in order:
+            c, lo, hi = boot_ci(dd.loc[dd["sequence_type"] == seq, m].to_numpy())
+            centers.append(c); lows.append(lo); highs.append(hi)
+
+        centers = np.array(centers, float)
+        lows = np.array(lows, float)
+        highs = np.array(highs, float)
+
+        # dashed grey line
+        ax.plot(x, centers, "--", color=line_color, lw=line_width, zorder=3)
+
+        # CI bars + white marker with colored ring
+        yerr = np.vstack([centers - lows, highs - centers])
+        ax.errorbar(x, centers, yerr=yerr, fmt="o", ms=9,
+                    mfc="white", mec="black", mew=1.2,
+                    ecolor="black", elinewidth=2.0, capsize=7, zorder=4)
+
+        ax.scatter(x, centers, s=160, facecolors="none",
+                   edgecolors=[palette[s] for s in order], linewidths=2.0, zorder=5)
+
+        ax.set_title(title)
+        ax.set_ylabel(title)
+        ax.set_xlabel("Sequence order")
+        ax.set_ylim(*ylim)
+        ax.set_xticks(x)
+        ax.set_xticklabels(order, ha="right")
+        ax.grid(True, axis="y", alpha=0.25)
+
+    fig.suptitle(f"Trend across sequences ({estimator}, bootstrap {ci}% CI)", fontsize=15, y=1.02)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=250, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+def plot_sequence_trends_across_scenarios(
+    df_list: list[pd.DataFrame],
+    scenario_labels: list[str],
+    scenario_order: Optional[list[str]] = None,
+    sequence_order: Optional[list[str]] = None,
+    metric: str = "valence",
+    ylim: Optional[tuple[float, float]] = None,
+    save_path: Optional[Path] = None,
+):
+    # --- combine
+    d_all = []
+    for df, sc in zip(df_list, scenario_labels):
+        tmp = df.copy()
+        tmp["scenario"] = sc
+        tmp["sequence_type"] = tmp["sequence_list"].apply(lambda seq: " → ".join(map(str, seq)))
+        d_all.append(tmp)
+    d = pd.concat(d_all, ignore_index=True)
+
+    d = d[["scenario", "sequence_type", metric]].dropna()
+
+    if scenario_order is None:
+        scenario_order = scenario_labels
+    d["scenario"] = pd.Categorical(d["scenario"], categories=scenario_order, ordered=True)
+
+    if sequence_order is not None:
+        # keep only those that exist
+        present = set(d["sequence_type"].unique())
+        seq_order = [s for s in sequence_order if s in present]
+    else:
+        seq_order = sorted(d["sequence_type"].unique())
+
+    d["sequence_type"] = pd.Categorical(d["sequence_type"], categories=seq_order, ordered=True)
+
+    plt.figure(figsize=(10, 5.5))
+
+    # mean + 95% CI, connected across scenarios
+    sns.pointplot(
+        data=d,
+        x="scenario", y=metric,
+        hue="sequence_type",
+        order=scenario_order,
+        dodge=0.25,
+        errorbar=("ci", 95),
+        markers="o",
+        linestyles="-",
+    )
+
+    plt.title(f"{metric.title()} by Sequence across Scenarios")
+    plt.xlabel("Scenario")
+    plt.ylabel(metric.title())
+    if ylim is not None:
+        plt.ylim(*ylim)
+    plt.grid(True, axis="y", alpha=0.25)
+    plt.legend(title="Sequence", bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=250, bbox_inches="tight")
         plt.close()
     else:
         plt.show()
@@ -2367,45 +2631,36 @@ def plot_bland_altman(
     measurement2: str,
     label_col: str,
     save_path: Optional[Path] = None
-) -> None:
+) -> dict:
     """
-    Generates and saves or shows a Bland-Altman plot to compare two measurements.
-
-    :param df: DataFrame containing the data.
-    :param measurement1: Column name of the first measurement (e.g., 'valence').
-    :param measurement2: Column name of the second measurement (e.g., 'valence_online').
-    :param label_col: Column name for the point labels (e.g., 'video_id').
-    :param save_path: Optional file path to save the plot. If None, the plot is shown.
+    Bland-Altman plot comparing two measurements. Returns the agreement
+    statistics (bias and 95% limits of agreement) so they can be tabled.
     """
-    # 1. Prepare the data by dropping NaNs and calculating average/difference
     df_agree = df.dropna(subset=[measurement1, measurement2]).copy()
     avg_col = 'average_score'
     diff_col = 'difference_score'
     df_agree[avg_col] = (df_agree[measurement1] + df_agree[measurement2]) / 2
     df_agree[diff_col] = df_agree[measurement1] - df_agree[measurement2]
 
-    # 2. Calculate statistical limits
     mean_diff = df_agree[diff_col].mean()
     std_diff = df_agree[diff_col].std()
     upper_loa = mean_diff + 1.96 * std_diff
     lower_loa = mean_diff - 1.96 * std_diff
 
-    # 3. Create the plot
     plt.figure(figsize=(5, 5))
     plt.scatter(df_agree[avg_col], df_agree[diff_col], alpha=0.7)
 
     for index, row in df_agree.iterrows():
-        label = str(row[label_col])
-        plt.text(row[avg_col], row[diff_col], label, fontsize=8, ha='center', va='bottom')
+        plt.text(row[avg_col], row[diff_col], str(row[label_col]),
+                 fontsize=8, ha='center', va='bottom')
 
-    # Plot the reference lines
     plt.axhline(mean_diff, color='red', linestyle='--', label='Mean Difference (Bias)')
     plt.axhline(upper_loa, color='gray', linestyle='--', label='Upper Limit of Agreement')
     plt.axhline(lower_loa, color='gray', linestyle='--', label='Lower Limit of Agreement')
     title1 = measurement1.replace('_', ' ').title()
     title2 = measurement2.replace('_', ' ').title()
     plt.title(f'Bland-Altman Plot: {title1} vs. {title2}')
-    plt.xlabel(f'Average of Scores')
+    plt.xlabel('Average of Scores')
     plt.ylabel(f'Difference in Scores ({measurement1} - {measurement2})')
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -2417,3 +2672,471 @@ def plot_bland_altman(
     else:
         plt.show()
 
+    return {'n': len(df_agree), 'bias': mean_diff,
+            'lower_loa': lower_loa, 'upper_loa': upper_loa, 'sd_diff': std_diff}
+
+def plot_typology_parallel_coords(df, feature_cols, id_col, categorical_maps=None, save_path=None):
+    """
+    Plots a parallel coordinates chart.
+    - Video ID is the first axis.
+    - Continuous variables show formatted Min/Max ranges.
+    - Categorical variables show specific labels at their data points.
+    - Uses a distinct color palette to trace individual video trajectories.
+    """
+    if categorical_maps is None:
+        categorical_maps = {}
+
+    sns.set_style("white")
+
+    df_clean = df.dropna(subset=feature_cols, how='all').copy()
+    plot_cols = [id_col] + feature_cols
+
+    scaled_data = np.zeros((len(df_clean), len(plot_cols)))
+
+    fig, ax = plt.subplots(figsize=(16, 8))
+    x_coords = np.arange(len(plot_cols))
+
+    def format_val(val):
+        if isinstance(val, (int, np.integer)) or val.is_integer():
+            return f"{int(val)}"
+        if abs(val) < 10 and abs(val) > 0:
+            return f"{val:.2f}"
+        return f"{val:.1f}"
+
+    for i, col in enumerate(plot_cols):
+        x = x_coords[i]
+
+        if col in categorical_maps:
+            mapping = {str(k).lower().strip(): v for k, v in categorical_maps[col].items()}
+            raw_vals = df_clean[col].astype(str).str.lower().str.strip()
+            mapped_vals = raw_vals.map(mapping)
+
+            if mapped_vals.isna().any():
+                unmapped = raw_vals[mapped_vals.isna()].unique()
+                print(f"Unmapped values in '{col}': {unmapped}. Filling with 0.5 to prevent breaks.")
+                mapped_vals = mapped_vals.fillna(0.5)
+
+            scaled_data[:, i] = mapped_vals.values
+
+            for cat_name, val in mapping.items():
+                clean_name = cat_name.replace('_', ' ').title()
+                ax.text(x + 0.03, val, clean_name,
+                        va='center', ha='left', fontsize=14, color='#333333',
+                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=0))
+        else:
+            # --- CONTINUOUS VARIABLES ---
+            if df_clean[col].isna().any():
+                df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+
+            col_min = df_clean[col].min()
+            col_max = df_clean[col].max()
+
+            if col_max - col_min == 0:
+                scaled_data[:, i] = 0.5
+            else:
+                scaled_data[:, i] = (df_clean[col].values - col_min) / (col_max - col_min)
+
+            if col != id_col:
+                ax.text(x + 0.03, 0.0, format_val(col_min), va='center', ha='left', fontsize=14, color='#333333',
+                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=0))
+                ax.text(x + 0.03, 1.0, format_val(col_max), va='center', ha='left', fontsize=14, color='#333333',
+                        bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=0))
+
+    line_colors = sns.color_palette("tab20", n_colors=len(df_clean))
+
+    for array_idx, (df_idx, row) in enumerate(df_clean.iterrows()):
+        vid = int(row[id_col])
+        color = line_colors[array_idx]
+        ax.plot(x_coords, scaled_data[array_idx, :], color=color, alpha=0.8, linewidth=2.5)
+        ax.text(0 - 0.04, scaled_data[array_idx, 0], str(vid), fontsize=14, va='center', ha='right', color='#222222')
+
+    ax.set_xticks(x_coords)
+    clean_labels = ['Video ID'] + [col.replace('_', '\n').title() for col in feature_cols]
+    clean_labels = [l.replace('Numeric', '').replace('Kmh', '(km/h)').replace('Total Count', 'Count') for l in
+                    clean_labels]
+
+    ax.set_xticklabels(clean_labels, fontsize=14, linespacing=1.2)
+
+    for x in x_coords:
+        ax.axvline(x, color='darkgrey', linewidth=1.5, alpha=0.6, zorder=0)
+
+    ax.set_yticks([])
+    ax.set_title("Environmental Compositions of Cycling Scenarios", fontsize=18, pad=25)
+
+    ax.spines['top'].set_visible(False)
+    ax.spines['bottom'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.patches import Patch
+
+
+def plot_transposed_scenario_heatmap(
+        df,
+        feature_cols,
+        id_col,
+        categorical_maps=None,
+        save_path=None
+):
+    """
+    Plots a transposed categorical heatmap with perfectly square cells.
+    - Categorical variables get globally unique colors across ALL features (no overlap).
+    - Continuous variables use diverse, distinct continuous color scales (Min -> Max).
+    - Legend creates one distinct horizontal row per categorical feature.
+    """
+    if categorical_maps is None:
+        categorical_maps = {}
+
+    sns.set_style("white")
+    df_clean = df.dropna(subset=feature_cols, how='all').copy()
+
+    color_data = pd.DataFrame(index=df_clean.index)
+    annot_data = pd.DataFrame(index=df_clean.index)
+
+    color_data[id_col] = df_clean[id_col]
+    annot_data[id_col] = df_clean[id_col]
+
+    def format_number(val):
+        if pd.isna(val): return ""
+        val = float(val)
+
+        if abs(val) >= 1000:
+            return f"{int(val):,}"
+        if val.is_integer():
+            return f"{int(val)}"
+        if 0 < abs(val) < 1:
+            return f"{val:.2f}"
+
+        return f"{val:.1f}"
+
+    # Helper to shorten and clean attribute names
+    def shorten_feature_name(name):
+        clean = name.replace('_', ' ').title()
+        replacements = {
+            'Bike Infra Type': 'Bike Infra',
+            'Average': 'Avg.',
+            'Car Lanes Total Count': 'Car Lanes Count',
+            'Kmh': '(km/h)',
+            'Traffic Volume': 'Traffic Vol. (AADT)',
+            'Motorized Traffic Speed': 'Speed',
+            'Motor Vehicle Overtakes Count': 'Overtakes Count',
+            'Share': '(%)',
+            'Ped And Cycl Count': 'Ped. & Cycl. Count'
+        }
+        for old, new in replacements.items():
+            clean = clean.replace(old, new)
+        return clean.strip()
+
+    for col in feature_cols:
+        if col in categorical_maps:
+            mapping = {str(k).lower().strip(): idx for idx, k in enumerate(categorical_maps[col].keys())}
+            raw_vals = df_clean[col].astype(str).str.lower().str.strip()
+            color_data[col] = raw_vals.map(mapping).fillna(0)
+            annot_data[col] = ""
+        else:
+            if df_clean[col].isna().any():
+                df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+
+            color_data[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0)
+            annot_data[col] = df_clean[col].apply(format_number)
+
+    plot_color_df = color_data.set_index(id_col).sort_index().T
+    plot_annot_df = annot_data.set_index(id_col).sort_index().T
+    n_features = len(feature_cols)
+    n_videos = plot_color_df.shape[1]
+    cell_size = 0.65
+    fig_width = max(12, n_videos * cell_size + 2)
+    fig_height = (n_features * cell_size) + 2.0
+
+    fig, axes = plt.subplots(
+        nrows=n_features,
+        ncols=1,
+        figsize=(fig_width, fig_height),
+        gridspec_kw={'hspace': 0}
+    )
+    if n_features == 1: axes = [axes]
+
+    # Highly distinct continuous colormaps so no two attributes look the same
+    continuous_cmaps = [
+        'Blues', 'Greens', 'Oranges', 'Purples', 'Reds',
+        'Greys', 'PuRd', 'YlGn', 'BuPu', 'OrRd', 'GnBu'
+    ]
+    cont_cmap_idx = 0
+
+    # Massive pool of globally unique colors for categories (combining palettes for 40+ colors)
+    global_cat_colors = sns.color_palette("tab20", 20) + sns.color_palette("tab20b", 20) + sns.color_palette("tab20c", 20)
+    global_cat_color_idx = 0
+    feature_legend_groups = []
+
+    for i, (feature_name, ax) in enumerate(zip(plot_color_df.index, axes)):
+        row_color = plot_color_df.loc[[feature_name]]
+        row_annot = plot_annot_df.loc[[feature_name]]
+
+        if feature_name in categorical_maps:
+            n_cats = len(categorical_maps[feature_name])
+            base_palette = global_cat_colors[global_cat_color_idx: global_cat_color_idx + n_cats]
+            global_cat_color_idx += n_cats
+
+            cmap = mcolors.ListedColormap(base_palette)
+            vmin, vmax = 0, n_cats - 1
+
+            feature_patches = []
+            cat_keys = list(categorical_maps[feature_name].keys())
+
+            for j, cat in enumerate(cat_keys):
+                clean_cat = cat.replace('_', ' ').title()
+                label_text = clean_cat
+                feature_patches.append(
+                    Patch(facecolor=base_palette[j], edgecolor='gray', label=label_text)
+                )
+
+            feature_legend_groups.append(feature_patches)
+        else:
+            # Handle Continuous Row
+            cmap = continuous_cmaps[cont_cmap_idx % len(continuous_cmaps)]
+            cont_cmap_idx += 1
+
+            vmin = row_color.min(axis=1).values[0]
+            vmax = row_color.max(axis=1).values[0]
+
+            if vmin == vmax:
+                vmin -= 1
+                vmax += 1
+
+        sns.heatmap(row_color, annot=row_annot, fmt="", cmap=cmap, vmin=vmin, vmax=vmax,
+                    cbar=False, linewidths=1.5, linecolor='white', square=True,
+                    annot_kws={"size": 17}, ax=ax)
+
+        clean_label = shorten_feature_name(feature_name)
+        ax.set_yticks([0.5])
+        ax.set_yticklabels([clean_label], rotation=0, fontsize=18, color='#222222')
+        ax.set_ylabel('')
+
+        if i < n_features - 1:
+            ax.set_xticks([])
+        else:
+            ax.set_xticklabels(ax.get_xticklabels(), rotation=0, fontsize=20)
+            ax.set_xlabel("Video ID", fontsize=22, fontweight='bold', labelpad=12)
+
+    axes[0].set_title("Environmental Compositions of Cycling Scenarios", fontsize=22, pad=25, fontweight='bold')
+
+    if feature_legend_groups:
+        n_legend_rows = len(feature_legend_groups)
+        bottom_space = 0.04 + (0.04 * n_legend_rows)
+        plt.tight_layout(rect=[0, bottom_space, 1, 1])
+
+        current_y = bottom_space
+
+        for handles in feature_legend_groups:
+            fig.legend(handles=handles, loc='upper left', bbox_to_anchor=(0.12, current_y),
+                       fontsize=20, frameon=False, ncol=len(handles), handletextpad=0.1)
+
+            current_y -= 0.04
+    else:
+        plt.tight_layout(rect=[0, 0.08, 1, 1])
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_ranking_distribution(
+    df: pd.DataFrame,
+    pair_col: str = "pair",
+    ranking_col: str = "ranking",
+    sequence_order: Optional[list] = None,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    Stacked proportion bars: for each sequence, the share of participants
+    assigning each rank (1 = best ... 4 = worst). For ordinal repeated rankings.
+    """
+    d = df[[pair_col, ranking_col]].dropna().copy()
+    d[ranking_col] = d[ranking_col].astype(int)
+
+    order = ([s for s in sequence_order if s in d[pair_col].unique()]
+             if sequence_order else sorted(d[pair_col].unique()))
+    ranks = sorted(d[ranking_col].unique())
+
+    tab = (d.groupby([pair_col, ranking_col]).size()
+             .unstack(fill_value=0).reindex(index=order, columns=ranks, fill_value=0))
+    pct = tab.div(tab.sum(axis=1), axis=0) * 100
+
+    colors = sns.color_palette("RdYlGn_r", n_colors=len(ranks))  # rank 1 green, 4 red
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bottom = np.zeros(len(order))
+    for i, r in enumerate(ranks):
+        vals = pct[r].to_numpy()
+        ax.bar(order, vals, bottom=bottom, color=colors[i], label=f"Rank {r}")
+        for j, (v, b) in enumerate(zip(vals, bottom)):
+            if v >= 6:
+                ax.text(j, b + v / 2, f"{v:.0f}", ha="center", va="center",
+                        fontsize=10, color="black")
+        bottom += vals
+
+    ax.set_ylabel("Participants (%)")
+    ax.set_xlabel("Sequence")
+    ax.set_ylim(0, 100)
+    ax.set_title("Recalled ranking distribution by sequence")
+    ax.legend(title="Rank (1 = best)", bbox_to_anchor=(1.02, 1), loc="upper left")
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+def plot_ranking_distribution_combined(
+    blocks: list,                # list of (df, title, sequence_order) tuples
+    pair_col: str = "sequence_type",
+    ranking_col: str = "ranking",
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    Stacked rank-proportion bars for several blocks side by side in one figure.
+    Each block: (dataframe, panel_title, sequence_order_list).
+    """
+    n = len(blocks)
+    fig, axes = plt.subplots(1, n, figsize=(5.2 * n, 5), sharey=True)
+    if n == 1:
+        axes = [axes]
+
+    # consistent rank colors across all panels (rank 1 = green ... rank 4 = red)
+    all_ranks = sorted({int(r) for df, _, _ in blocks
+                        for r in df[ranking_col].dropna().unique()})
+    colors = dict(zip(all_ranks, sns.color_palette("RdYlGn_r", n_colors=len(all_ranks))))
+
+    for ax, (df, title, order) in zip(axes, blocks):
+        d = df[[pair_col, ranking_col]].dropna().copy()
+        d[ranking_col] = d[ranking_col].astype(int)
+        order = [s for s in order if s in d[pair_col].unique()]
+
+        tab = (d.groupby([pair_col, ranking_col]).size()
+                 .unstack(fill_value=0).reindex(index=order, columns=all_ranks, fill_value=0))
+        pct = tab.div(tab.sum(axis=1), axis=0) * 100
+
+        bottom = np.zeros(len(order))
+        for r in all_ranks:
+            vals = pct[r].to_numpy()
+            ax.bar(range(len(order)), vals, bottom=bottom, color=colors[r], label=f"Rank {r}")
+            for j, (v, b) in enumerate(zip(vals, bottom)):
+                if v >= 7:
+                    ax.text(j, b + v / 2, f"{v:.0f}", ha="center", va="center", fontsize=9)
+            bottom += vals
+
+        ax.set_title(title, fontsize=13)
+        ax.set_xticks(range(len(order)))
+        ax.set_xticklabels(order, rotation=30, ha="right", fontsize=9)
+        ax.set_ylim(0, 100)
+        ax.set_xlabel("Sequence")
+
+    axes[0].set_ylabel("Participants (%)")
+    # single shared legend
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, title="Rank (1 = best)",
+               bbox_to_anchor=(1.0, 0.9), loc="upper left")
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_emm_interaction(emm_df, outcome_name, output_dir, log_obj):
+    """
+    Plots the Estimated Marginal Means (EMMs) showing the interaction
+    between sequence type and spoiler position.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    colors = {"Positive": "#2ca02c", "Negative": "#d62728"}
+    labels = {"Positive": "Positive Block (NB Spoiler)", "Negative": "Negative Block (B Spoiler)"}
+
+    for block in ["Positive", "Negative"]:
+        subset = emm_df[emm_df["block"] == block]
+
+        lower_error = subset["emm"] - subset["ci_low"]
+        upper_error = subset["ci_high"] - subset["emm"]
+
+        ax.errorbar(
+            subset["position"], subset["emm"], yerr=[lower_error, upper_error],
+            fmt='-o', capsize=5, capthick=1.5, linewidth=2, markersize=8,
+            label=labels[block], color=colors[block]
+        )
+
+    ax.set_xticks([0, 1, 2, 3])
+    ax.set_xticklabels(["Homogeneous\nBaseline", "Spoiler\nPos 1", "Spoiler\nPos 2", "Spoiler\nPos 3"], fontsize=11)
+
+    ax.set_ylim(-1.05, 1.05)
+    ax.axhline(0, color='gray', linestyle='--', linewidth=1, zorder=0)
+
+    ax.set_ylabel(f"Estimated Marginal Mean ({outcome_name.capitalize()})", fontsize=12, fontweight='bold')
+    ax.set_title(f"Interaction of Sequence Type and Spoiler Position on {outcome_name.capitalize()}", fontsize=14)
+    ax.legend(loc="best", frameon=True, fontsize=10)
+
+    plt.tight_layout()
+    plot_path = output_dir / f"task3_EMM_plot_{outcome_name}.png"
+    fig.savefig(plot_path, dpi=300)
+    plt.close(fig)
+
+    log_obj.info(f"Successfully generated and saved EMM plot to {plot_path}")
+
+
+def plot_clip_affect_space(
+    df: pd.DataFrame,
+    valence_col: str = "valence",
+    arousal_col: str = "arousal",
+    id_col: str = c.VIDEO_ID_COL,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    Scatter of clip-level mean valence/arousal (centroids) on the Affect Grid (Stage 1).
+    """
+    d = df.dropna(subset=[valence_col, arousal_col]).copy()
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    # Affect Grid backdrop
+    for gv in np.arange(-1, 1 + 1e-9, 0.2):
+        ax.axhline(gv, color="lightgrey", lw=0.8, zorder=0)
+        ax.axvline(gv, color="lightgrey", lw=0.8, zorder=0)
+    ax.axhline(0, color="darkgrey", lw=1.2, zorder=1)
+    ax.axvline(0, color="darkgrey", lw=1.2, zorder=1)
+
+    # Clip centroids
+    ax.scatter(d[valence_col], d[arousal_col], s=90,
+               color="#3376b5", edgecolor="white", linewidth=0.9, zorder=3)
+    for _, r in d.iterrows():
+        ax.text(r[valence_col], r[arousal_col], str(int(r[id_col])),
+                fontsize=7, ha="center", va="center", zorder=4, color="#222")
+
+    ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Valence [-1, 1]", fontsize=13)
+    ax.set_ylabel("Arousal [-1, 1]", fontsize=13)
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title("Clip-level affect (lab centroids)", fontsize=14, fontweight="bold")
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
