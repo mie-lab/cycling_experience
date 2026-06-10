@@ -1,16 +1,63 @@
-import pandas as pd
 import configparser
 import utils.helper_functions
 import utils.lmm_utils
 import utils.plotting_utils
 import utils.processing_utils
-from pathlib import Path
 import logging
 import constants as c
+import numpy as np
+import pandas as pd
+from scipy import stats
+from pathlib import Path
+from scipy.stats import friedmanchisquare
+from statsmodels.stats.multitest import multipletests
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+
+
+
+
+def run_ranking_analysis(df: pd.DataFrame, participant_col: str, condition_col: str, ranking_col: str):
+    """
+    Runs a Friedman Chi-Square test and calculates Kendall's W for ranking data.
+
+    :param df: DataFrame containing the ranking data
+    :param participant_col: Column name for participant IDs
+    :param condition_col: Column name for the conditions being ranked (e.g., sequence_type)
+    :param ranking_col: Column name for the assigned rank
+    :return: Tuple of (Friedman statistic, p-value, Kendall's W)
+    """
+    # Pivot the data so rows are participants and columns are the ranked conditions
+    pivot_df = df.pivot(index=participant_col, columns=condition_col, values=ranking_col).dropna()
+
+    if pivot_df.empty:
+        log.warning(
+            "Pivoted ranking dataframe is empty. Check for missing values or duplicate participant/condition pairs.")
+        return np.nan, np.nan, np.nan
+
+    # Extract columns into a list of arrays for the Friedman test
+    conditions = pivot_df.columns
+    data_arrays = [pivot_df[cond].values for cond in conditions]
+
+    # 1. Friedman Test
+    stat, p_val = friedmanchisquare(*data_arrays)
+
+    # 2. Kendall's W
+    n_participants = pivot_df.shape[0]
+    k_conditions = pivot_df.shape[1]
+
+    # Formula: W = Chi^2 / (N * (k - 1))
+    w = stat / (n_participants * (k_conditions - 1))
+
+    log.info(f"--- Ranking Analysis ---")
+    log.info(f"Conditions compared: {list(conditions)}")
+    log.info(f"N Participants: {n_participants}")
+    log.info(f"Friedman Chi-Square: {stat:.3f}, p-value: {p_val:.4f}")
+    log.info(f"Kendall's W (Agreement): {w:.3f}")
+
+    return stat, p_val, w
 
 def main():
     """
@@ -38,18 +85,15 @@ def main():
     # ==============================================================================
     # PHASE 1: LOAD DATA
     # ==============================================================================
-    log.info('Phase 2.1: Loading and Processing Online Survey Data')
+
+    log.info("Phase 1.1: Online survey (validation reference)")
+
     survey_df = pd.read_excel(online_results_file).set_index(c.PARTICIPANT_ID)
     online_seq_df = pd.read_csv(online_sequence_file, parse_dates=['seq_start', 'seq_end'])
 
-    # Transform survey responses into a long format
     survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, online_seq_df, id_col=c.PARTICIPANT_ID)
-
-    # Clean and preprocess the survey response data
     survey_results_df = utils.processing_utils.filter_results(survey_results_df)
     survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
-
-    # Aggregate demographic categories to ensure sufficient sample size in each group
     survey_results_df = utils.processing_utils.aggregate_by_characteristics(
         survey_results_df,
         age=True,
@@ -62,523 +106,461 @@ def main():
         is_swiss=True
     )
 
-    # Calculate video-level affect metrics and save to CSV
-    online_video_level_scores = utils.processing_utils.calculate_video_level_scores(
-        survey_results_df,
-        lab_bool=True
-    )
-
+    online_video_level_scores = utils.processing_utils.calculate_video_level_scores(survey_results_df, lab_bool=True)
     online_video_level_scores = online_video_level_scores.rename(columns={c.VALENCE: 'valence_online', c.AROUSAL: 'arousal_online'})
 
-    log.info('Phase 2.2: Loading and Processing Lab Study Data')
-    lab_results_df = pd.read_excel(lab_results_file).set_index(c.PARTICIPANT_ID, drop=True)
+    log.info("Phase 1.2: Lab study (ratings + demographics)")
 
+    lab_results_df = pd.read_excel(lab_results_file).set_index(c.PARTICIPANT_ID, drop=True)
     lab_results_df = utils.processing_utils.aggregate_by_characteristics(
         lab_results_df,
-        age=True,
-        gender=True,
         cycling_frequency=True,
         cycling_confidence=True,
-        cycling_purpose=True,
-        cycling_environment=True
-    )
+        cycling_purpose=True)
 
-    demographics_df = lab_results_df[
-        [col for col in c.DEMOGRAPHIC_COLUMNS if col != c.IS_SWISS]
-    ]
+    demographics_df = lab_results_df[[col for col in c.DEMOGRAPHIC_COLUMNS if col != c.IS_SWISS]]
 
     lab_results_df = (
         lab_results_df
+        .replace(r'\s*\((best|worst) experience\)', '', regex=True)
         .drop(columns=[col for col in c.DEMOGRAPHIC_COLUMNS if col != c.IS_SWISS] + [c.START, c.END])
         .apply(pd.to_numeric, errors='coerce')
     )
 
-    log.info('reading the lab video sequence and experiment setup files')
+    log.info("Phase 1.3: Sequence, setup, and prediction files")
+
     lab_seq_df = pd.read_csv(lab_sequence_file)
     experiment_setup = pd.read_csv(lab_setup_file, header=None).set_index(0, drop=True)
-
-    log.info('Phase 2.3: Loading and Processing Video Prediction Data')
     video_score_predictions = pd.read_csv(video_predictions_file)
 
     # ==============================================================================
-    # PHASE 2: BLOCK 1 ANALYSIS (VIDEO VALIDATION)
+    # STAGE 1: STIMULUS VALIDATION (Task 1 single-clip ratings)
     # ==============================================================================
+    log.info("\n--- Stage 1: Stimulus validation ---")
 
-    log.info("\n--- Block 1 Analysis ---")
+    # Task 1 ratings -> long -> valence/arousal -> clip-level means
     df_baseline = utils.helper_functions.get_trial_dict(
-        lab_results_df,
-        experiment_setup,
-        c.TRIAL_1,
-        c.VIDEO_COUNTS
+        lab_results_df, experiment_setup, c.TRIAL_1, c.VIDEO_COUNTS
     )
     df1 = utils.helper_functions.trial_dict_to_df(df_baseline)
     df1 = utils.processing_utils.add_valence_arousal(df1, ag_col='rating')
-
-    # Aggregate individual ratings to get a single summary score per video.
     lab_video_scores = utils.processing_utils.calculate_video_level_scores(df1, lab_bool=True)
 
-    # Merge lab scores with online scores and model predictions for comparison.
-    video_level_scores = pd.merge(lab_video_scores, online_video_level_scores, on=c.VIDEO_ID_COL, how='left')
-    video_level_scores = pd.merge(video_level_scores, video_score_predictions, on=c.VIDEO_ID_COL, how='left')
+    # Lab-sample valence–arousal coupling: clip-level Pearson (matches the manuscript's
+    # linear inverse coupling; computed before the merge while columns are plain).
 
-    # print comparisons between lab scores, online scores, and model predictions.
-    utils.helper_functions.get_video_level_metrics(video_level_scores, c.VALENCE, 'valence_prediction', 'valence_online')
+    va_r = lab_video_scores[['valence', 'arousal']].corr(method='pearson').iloc[0, 1]
+    log.info(f"Lab-sample valence–arousal coupling (clip-level Pearson): r = {va_r:.3f}")
 
-    #utils.helper_functions.check_variance_homogeneity(df1, c.PARTICIPANT_ID, c.VALENCE)
-    #utils.helper_functions.check_variance_homogeneity(df1, c.VIDEO_ID_COL, c.VALENCE)
-
-    #utils.plotting_utils.plot_bland_altman(
-    #    df=video_level_scores,
-    #    measurement1='valence',
-    #    measurement2='valence_online',
-    #    label_col=c.VIDEO_ID_COL,
-    #    save_path=output_dir / 'bland_altman_valence_video.png'
-    #)
-
-    #utils.plotting_utils.plot_bland_altman(
-    #    df=video_level_scores,
-    #    measurement1='arousal',
-    #    measurement2='arousal_online',
-    #    label_col=c.VIDEO_ID_COL,
-    #    save_path=output_dir / 'bland_altman_arousal_video.png'
-    #)
-
-    # ==============================================================================
-    # PHASE 3: BLOCK 2 ANALYSIS (EQUAL SCENARIO)
-    # ==============================================================================
-
-    log.info("\n--- Analyzing Block 2 (Equal Scenario) ---")
-    df_equal = utils.helper_functions.load_and_process_trial_data(
-        lab_results_df,
-        experiment_setup,
-        lab_seq_df,
-        c.TRIAL_2_PARAMS,
-        video_level_scores
+    # Merge lab <- online <- k-NN prediction, keyed on clip id
+    video_level_scores = (
+        lab_video_scores
+        .merge(online_video_level_scores, on=c.VIDEO_ID_COL, how='left')
+        .merge(video_score_predictions, on=c.VIDEO_ID_COL, how='left')
     )
-    df_equal = pd.merge(df_equal, demographics_df, on=c.PARTICIPANT_ID, how='left')
+    video_level_scores.to_csv(output_dir / 'stage1_clip_validation.csv', index=False)
 
-    utils.plotting_utils.plot_violin_trend_panels(
-        df_equal,
-        'Equally Positive and Negative Route',
-        sequence_order=c.TRIAL_2_PLOT_ORDER,
-        save_path=output_dir / 'trial_2_trends_violin.png'
+    # Agreement metrics (valence has a prediction; arousal does not)
+    val_metrics = utils.helper_functions.get_video_level_metrics(
+        video_level_scores, c.VALENCE, 'valence_prediction', 'valence_online'
+    )
+    aro_metrics = utils.helper_functions.get_video_level_metrics(
+        video_level_scores, c.AROUSAL, None, 'arousal_online'
+    )
+    pd.DataFrame({'valence': val_metrics, 'arousal': aro_metrics}).to_csv(
+        output_dir / 'stage1_agreement_metrics.csv'
     )
 
-    utils.plotting_utils.plot_sequence_trend_panels(
-        df_equal,
-        sequence_order=c.TRIAL_2_PLOT_ORDER,
-        estimator="mean",
-        save_path=output_dir / "trial_2_trends_CI.png",
+    # Bland–Altman absolute-agreement plots (lab vs online), both axes
+    ba_val = utils.plotting_utils.plot_bland_altman(
+        df=video_level_scores, measurement1='valence', measurement2='valence_online',
+        label_col=c.VIDEO_ID_COL, save_path=output_dir / 'stage1_bland_altman_valence.png'
     )
+    ba_aro = utils.plotting_utils.plot_bland_altman(
+        df=video_level_scores, measurement1='arousal', measurement2='arousal_online',
+        label_col=c.VIDEO_ID_COL, save_path=output_dir / 'stage1_bland_altman_arousal.png'
+    )
+    pd.DataFrame({'valence': ba_val, 'arousal': ba_aro}).to_csv(
+        output_dir / 'stage1_bland_altman_stats.csv'
+    )
+    log.info(f"Bland–Altman valence: bias={ba_val['bias']:.3f}, "
+             f"LoA=[{ba_val['lower_loa']:.3f}, {ba_val['upper_loa']:.3f}]")
+    log.info(f"Bland–Altman arousal: bias={ba_aro['bias']:.3f}, "
+             f"LoA=[{ba_aro['lower_loa']:.3f}, {ba_aro['upper_loa']:.3f}]")
 
-    #utils.plotting_utils.plot_ranking_by_nb_pos(df_equal, 'NB_position', c.TRIAL_2_PARAMS, 'ranking', file_name)
-
-    # ==============================================================================
-    # PHASE 4: BLOCK 3 ANALYSIS (POSITIVE SCENARIO)
-    # ==============================================================================
-    log.info("\n--- Analyzing Block 3 (Positive Scenario) ---")
-
-    # --- 1. Load, Process, and Merge Data ---
-    df_positive = utils.helper_functions.load_and_process_trial_data(
-        lab_results_df,
-        experiment_setup,
-        lab_seq_df,
-        c.TRIAL_3_PARAMS,
+    utils.plotting_utils.plot_clip_affect_space(
         video_level_scores,
-        'NB'
+        save_path=output_dir / 'stage1_clip_affect_space.png'
+    )
+
+    # PHYSIOLOGICAL DATA validation still comes here.
+    # TODO
+
+    # ==============================================================================
+    # STAGE 2 (TASK 2): TWO-SEGMENT ORDER BLOCK - ranking + valence/arousal trends
+    # ==============================================================================
+    log.info("\n--- Task 2: two-segment order block ---")
+
+    df_two = utils.helper_functions.load_and_process_trial_data(
+        lab_results_df, experiment_setup, lab_seq_df, c.TRIAL_2_PARAMS, video_level_scores
+    )
+    df_two = pd.merge(df_two, demographics_df, on=c.PARTICIPANT_ID, how='left')
+
+    # Four-level pair factor (shared with the later LMM and the plots)
+    df_two['pair'] = df_two['sequence_list'].apply(lambda s: ' \u2192 '.join(map(str, s)))
+    df_two['sequence_type'] = df_two['pair']
+
+    # --- Descriptive trend (valence + arousal); arousal shows the sequence effect clearly
+    utils.plotting_utils.plot_sequence_trend_panels(
+        df_two, sequence_order=c.TRIAL_2_PLOT_ORDER, estimator="mean",
+        save_path=output_dir / 'task2_trends_CI.png'
+    )
+
+    # --- Recalled ranking: distribution plot + order tests (Wilcoxon)
+    utils.plotting_utils.plot_ranking_distribution(
+        df_two, pair_col='pair', ranking_col='ranking',
+        sequence_order=c.TRIAL_2_PLOT_ORDER,
+        save_path=output_dir / 'task2_ranking_distribution.png'
+    )
+
+    # Order tests (NB→B vs B→NB) on ranking, valence, arousal
+    w_rank = utils.helper_functions.wilcoxon_pair(
+        df_two, c.PARTICIPANT_ID, 'pair', 'ranking', 'NB \u2192 B', 'B \u2192 NB'
+    )
+    w_val = utils.helper_functions.wilcoxon_pair(
+        df_two, c.PARTICIPANT_ID, 'pair', 'valence', 'NB \u2192 B', 'B \u2192 NB'
+    )
+    w_aro = utils.helper_functions.wilcoxon_pair(
+        df_two, c.PARTICIPANT_ID, 'pair', 'arousal', 'NB \u2192 B', 'B \u2192 NB'
+    )
+    for label, w in [("ranking", w_rank), ("valence", w_val), ("arousal", w_aro)]:
+        log.info(f"Order ({label}): {w}")
+    pd.DataFrame([w_val, w_aro, w_rank]).to_csv(output_dir / 'task2_order_wilcoxon.csv', index=False)
+
+    # ==============================================================================
+    # STAGE 2 (TASK 3): POSITIVE BLOCK — NB spoiler in a bikeable context
+    # ==============================================================================
+    log.info("\n--- Task 3: Positive block (NB spoiler) ---")
+
+    df_positive = utils.helper_functions.load_and_process_trial_data(
+        lab_results_df, experiment_setup, lab_seq_df,
+        c.TRIAL_3_PARAMS, video_level_scores, 'NB'
     )
     df_positive = pd.merge(df_positive, demographics_df, on=c.PARTICIPANT_ID, how='left')
-
-    utils.plotting_utils.plot_violin_trend_panels(
-        df_positive,
-        'Predominantly Positive Route',
-        sequence_order=c.TRIAL_3_PLOT_ORDER,
-        save_path=output_dir / 'trial_3_trends_violin.png'
-    )
+    df_positive['sequence_type'] = df_positive['sequence_list'].apply(lambda s: ' \u2192 '.join(map(str, s)))
+    df_positive['spoiler_position'] = df_positive['NB_position']  # 0 = baseline, 1-3 = spoiler position
 
     utils.plotting_utils.plot_sequence_trend_panels(
-        df_positive,
+        df_positive, sequence_order=c.TRIAL_3_PLOT_ORDER, estimator="mean",
+        save_path=output_dir / 'task3_positive_trends_CI.png'
+    )
+    utils.plotting_utils.plot_ranking_distribution(
+        df_positive, pair_col='sequence_type', ranking_col='ranking',
         sequence_order=c.TRIAL_3_PLOT_ORDER,
-        estimator="mean",
-        save_path=output_dir / "trial_3_trends_CI.png",
+        save_path=output_dir / 'task3_positive_ranking_distribution.png'
     )
 
-    #rankings_plot_path = output_dir / 'trial_2_rankings.png'
-    #utils.plotting_utils.plot_ranking_by_nb_pos(
-    #    df=df_equal,
-    #    position_col='NB_position',
-    #    params=c.TRIAL_2_PARAMS,
-    #    ranking_col='ranking',
-    #    save_path=rankings_plot_path
-    #)
+    # Position effect on recalled ranking (spoiler positions only, baseline excluded)
+    fk_pos = utils.helper_functions.friedman_kendall(
+        df_positive[df_positive['spoiler_position'] != 0],
+        subject_col=c.PARTICIPANT_ID, condition_col='spoiler_position', value_col='ranking'
+    )
+    log.info(f"Positive ranking, position effect — Friedman chi2={fk_pos['chi2']:.2f}, "
+             f"df={fk_pos['df']}, p={fk_pos['p']:.4g}, Kendall W={fk_pos['kendall_w']:.3f} "
+             f"(n={fk_pos['n_subjects']}, k={fk_pos['n_conditions']})")
+    pd.DataFrame([fk_pos]).to_csv(output_dir / 'task3_positive_ranking_friedman.csv', index=False)
 
     # ==============================================================================
-    # PHASE 5: BLOCK 4 ANALYSIS (NEGATIVE SCENARIO)
+    # STAGE 2 (TASK 3): NEGATIVE BLOCK — B spoiler in a non-bikeable context
     # ==============================================================================
-    log.info("\n--- Analyzing Block 4 (Negative Scenario) ---")
+    log.info("\n--- Task 3: Negative block (B spoiler) ---")
 
-    # --- 1. Load, Process, and Merge Data ---
     df_negative = utils.helper_functions.load_and_process_trial_data(
-        lab_results_df,
-        experiment_setup,
-        lab_seq_df,
-        c.TRIAL_4_PARAMS,
-        video_level_scores,
-        'B'
+        lab_results_df, experiment_setup, lab_seq_df,
+        c.TRIAL_4_PARAMS, video_level_scores, 'B'
     )
     df_negative = pd.merge(df_negative, demographics_df, on=c.PARTICIPANT_ID, how='left')
-
-    # --- 2. Generate and Save Visualizations ---
-    utils.plotting_utils.plot_violin_trend_panels(
-        df_negative,
-        'Predominantly Negative Route',
-        sequence_order=c.TRIAL_4_PLOT_ORDER,
-        save_path=output_dir / 'trial_4_trends_violin.png'
-    )
+    df_negative['sequence_type'] = df_negative['sequence_list'].apply(lambda s: ' \u2192 '.join(map(str, s)))
+    df_negative['spoiler_position'] = df_negative['B_position']  # 0 = baseline, 1-3 = spoiler position
 
     utils.plotting_utils.plot_sequence_trend_panels(
-        df_negative,
+        df_negative, sequence_order=c.TRIAL_4_PLOT_ORDER, estimator="mean",
+        save_path=output_dir / 'task3_negative_trends_CI.png'
+    )
+    utils.plotting_utils.plot_ranking_distribution(
+        df_negative, pair_col='sequence_type', ranking_col='ranking',
         sequence_order=c.TRIAL_4_PLOT_ORDER,
-        estimator="mean",
-        save_path=output_dir / "trial_4_trends_CI.png",
+        save_path=output_dir / 'task3_negative_ranking_distribution.png'
     )
 
-    #rankings_plot_path = output_dir / 'trial_4_rankings.png'
-    #utils.plotting_utils.plot_ranking_by_nb_pos(
-    #    df=df_negative,
-    #    position_col='B_position',
-    #    params=c.TRIAL_4_PARAMS,
-    #    ranking_col='ranking',
-    #    save_path=rankings_plot_path
-    #)
+    fk_neg = utils.helper_functions.friedman_kendall(
+        df_negative[df_negative['spoiler_position'] != 0],
+        subject_col=c.PARTICIPANT_ID, condition_col='spoiler_position', value_col='ranking'
+    )
+    log.info(f"Negative ranking, position effect — Friedman chi2={fk_neg['chi2']:.2f}, "
+             f"df={fk_neg['df']}, p={fk_neg['p']:.4g}, Kendall W={fk_neg['kendall_w']:.3f} "
+             f"(n={fk_neg['n_subjects']}, k={fk_neg['n_conditions']})")
+    pd.DataFrame([fk_neg]).to_csv(output_dir / 'task3_negative_ranking_friedman.csv', index=False)
 
-    # ==============================================================================
-    # PHASE 6: STATISTICAL MODELING (LINEAR MIXED-EFFECTS MODELS)
-    # ==============================================================================
-    log.info("\n--- Phase 4: Running Linear Mixed-Effects Model Analyses ---")
-
-    # ------------------------------------------------------------------------------
-    # Part 1: Baseline Models - Analyzing Each Scenario in Isolation
-    # ------------------------------------------------------------------------------
-
-    log.info("--- Analyzing [Equal Scenario]: Does spoiler position matter in 50/50 case? ---")
-    df_equal['NB_count'] = df_equal['sequence_list'].apply(lambda seq: seq.count('NB'))
-    formula = "valence ~ C(NB_position)"
-    utils.lmm_utils.run_lmm(
-        df=df_equal[df_equal['NB_count'] < 2],  # filter for sequences with only one spoiler to isolate the effect.
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
+    utils.plotting_utils.plot_ranking_distribution_combined(
+        blocks=[
+            (df_two, "Two-segment routes", c.TRIAL_2_PLOT_ORDER),
+            (df_positive, "Three-segment: Positive", c.TRIAL_3_PLOT_ORDER),
+            (df_negative, "Three-segment: Negative", c.TRIAL_4_PLOT_ORDER),
+        ],
+        save_path=output_dir / 'ranking_distribution_combined.png'
     )
 
-    log.info("--- Analyzing [Negative Scenario]: Does spoiler position impact a mostly negative experience? ---")
-    formula = "valence ~ C(B_position)"
-    neg_scenario_model_simple = utils.lmm_utils.run_lmm(
-        df=df_negative,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    # ==========================================================================
+    # LMM PHASE — Tasks 2 & 3
+    #   Stage 2 : within-block position effects        (RQ1)
+    #   Stage 3 : pooled position × scenario model     (RQ1/RQ2/RQ3 inference)
+    #   Stage 4 : aggregation-rule comparison          (RQ3 mechanism)
+    #   Stage 4b: leave-one-participant-out CV         (RQ3 mechanism, generalization)
+    #   Stage 5 : covariate robustness (exploratory)
+    # All models: by-participant random intercept (ML, for valid AIC/BIC/LR).
+    # A crossed clip random effect was tested (diagnose_clip_random_effect) and
+    # estimated at the variance boundary (~0); measured per-segment values already
+    # absorb clip-level variability, so it is omitted here.
+    # ==========================================================================
+    log.info("\n--- LMM phase: Tasks 2 & 3 ---")
 
-    formula = "valence ~ C(B_position) * C(Gender)"
-    neg_scenario_model_gender = utils.lmm_utils.run_lmm(
-        df=df_negative,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(B_position) * C(Age)"
-    neg_scenario_model_age = utils.lmm_utils.run_lmm(
-        df=df_negative,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(B_position) * C(Cycling_confidence)"
-    neg_scenario_model_confidence = utils.lmm_utils.run_lmm(
-        df=df_negative,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(B_position) * C(Cycling_frequency)"
-    neg_scenario_model_frequency = utils.lmm_utils.run_lmm(
-        df=df_negative,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(B_position) * C(Cycling_purpose)"
-    neg_scenario_model_purpose = utils.lmm_utils.run_lmm(
-        df=df_negative,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(B_position) * C(Cycling_environment)"
-    neg_scenario_model_environment = utils.lmm_utils.run_lmm(
-        df=df_negative,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_gender, mixture=False)
-    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_age, mixture=False)
-    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_confidence, mixture=False)
-    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_frequency, mixture=False)
-    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_purpose, mixture=False)
-    utils.lmm_utils.lr_test_mixed(neg_scenario_model_simple, neg_scenario_model_environment, mixture=False)
-
-    log.info("--- Analyzing [Positive Scenario]: Does spoiler position impact a mostly positive experience? ---")
-    formula = "valence ~ C(NB_position)"
-    pos_scenario_model_simple = utils.lmm_utils.run_lmm(
-        df=df_positive,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(NB_position) * C(Gender)"
-    pos_scenario_model_gender = utils.lmm_utils.run_lmm(
-        df=df_positive,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(NB_position) * C(Age)"
-    pos_scenario_model_age = utils.lmm_utils.run_lmm(
-        df=df_positive,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(NB_position) * C(Cycling_confidence)"
-    pos_scenario_model_confidence = utils.lmm_utils.run_lmm(
-        df=df_positive,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(NB_position) * C(Cycling_frequency)"
-    pos_scenario_model_frequency = utils.lmm_utils.run_lmm(
-        df=df_positive,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(NB_position) * C(Cycling_purpose)"
-    pos_scenario_model_purpose = utils.lmm_utils.run_lmm(
-        df=df_positive,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    formula = "valence ~ C(NB_position) * C(Cycling_environment)"
-    pos_scenario_model_environment = utils.lmm_utils.run_lmm(
-        df=df_positive,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_gender, mixture=False)
-    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_age, mixture=False)
-    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_confidence, mixture=False)
-    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_frequency, mixture=False)
-    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_purpose, mixture=False)
-    utils.lmm_utils.lr_test_mixed(pos_scenario_model_simple, pos_scenario_model_environment, mixture=False)
-
-    # ------------------------------------------------------------------------------
-    # Part 2: Combined Analysis - Building More Complex Models
-    # ------------------------------------------------------------------------------
-    log.info("\n--- Preparing combined dataset for advanced modeling ---")
     df_combined = utils.processing_utils.prepare_combined_scenario_df(df_positive, df_negative)
 
-    # --- Model 1: Main Effects Model ---
-    log.info("--- Model 1: Testing Main Effects of Position and Scenario ---")
-    log.info("RQ: Do spoiler position and scenario each have an independent effect on valence?")
-    formula = "valence ~ C(spoiler_position) + C(scenario)"
-    model_1_additive = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    # --- One-time data integrity checks (not part of the analysis output) ---
+    for o in ["valence", "arousal"]:
+        seg = df_combined[[f"pos1_{o}", f"pos2_{o}", f"pos3_{o}"]].to_numpy()
+        assert np.allclose(df_combined[f"mean_{o}"], seg.mean(axis=1), atol=1e-2, equal_nan=True)
+        assert np.allclose(df_combined[f"pos_peak_{o}"], seg.max(axis=1), atol=1e-2)
+        assert np.allclose(df_combined[f"neg_peak_{o}"], seg.min(axis=1), atol=1e-2)
+        assert np.allclose(df_combined[f"end_{o}"], df_combined[f"pos3_{o}"], atol=1e-2)
+    log.info(f"Feature construction verified. N obs = {len(df_combined)}")
 
-    log.info("--- Model 2: Do spoiler position and scenario interact? ---")
-    log.info("RQ: Does the effect of a spoiler's position on overall valence DEPEND on scenario (positive/negative)?")
-    formula = "valence ~ C(spoiler_position) * C(scenario)"
-    model_2_interactive = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    # --- Contrast / EMM specifications (shared across outcomes) ---
+    position = "C(spoiler_position)"
+    scenario = "C(scenario)[T.Positive]"
 
-    log.info("--- Model 3: Adding individual sensitivity (Random Slopes) ---")
-    log.info("RQ: Do participants vary in their sensitivity to spoiler position?")
-    formula = "valence ~ C(spoiler_position) * C(scenario)"
-    re_formula_3 = "~ spoiler_position"
-    model_3_slopes = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        re_formula=re_formula_3,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    rq2_magnitude_spec = {
+        f"{position}[T.1]": -2 / 3, f"{position}[T.2]": -2 / 3, f"{position}[T.3]": -2 / 3,
+        f"{position}[T.1]:{scenario}": -1 / 3,
+        f"{position}[T.2]:{scenario}": -1 / 3,
+        f"{position}[T.3]:{scenario}": -1 / 3,
+    }
 
-    log.info("--- Model 4: Does gender moderate the interaction effect? ---")
-    log.info("RQ: Is the interaction between spoiler position and scenario different for different environments?")
-    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_environment)"
-    model_4_moderation = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    contrast_specs = {
+        "neg_p1_vs_base": {f"{position}[T.1]": 1},
+        "neg_p2_vs_base": {f"{position}[T.2]": 1},
+        "neg_p3_vs_base": {f"{position}[T.3]": 1},
+        "neg_p3_vs_p1": {f"{position}[T.3]": 1, f"{position}[T.1]": -1},
+        "pos_p1_vs_base": {f"{position}[T.1]": 1, f"{position}[T.1]:{scenario}": 1},
+        "pos_p2_vs_base": {f"{position}[T.2]": 1, f"{position}[T.2]:{scenario}": 1},
+        "pos_p3_vs_base": {f"{position}[T.3]": 1, f"{position}[T.3]:{scenario}": 1},
+        "pos_p3_vs_p1": {f"{position}[T.3]": 1, f"{position}[T.1]": -1,
+                         f"{position}[T.3]:{scenario}": 1, f"{position}[T.1]:{scenario}": -1},
+        # RQ2 negativity bias: |NB-spoiler shift| - |B-spoiler shift| (positive => negativity bias)
+        "rq2_magnitude": {f"{position}[T.1]": -2 / 3, f"{position}[T.2]": -2 / 3, f"{position}[T.3]": -2 / 3,
+                          f"{position}[T.1]:{scenario}": -1 / 3,
+                          f"{position}[T.2]:{scenario}": -1 / 3,
+                          f"{position}[T.3]:{scenario}": -1 / 3},
+    }
+    PLANNED_FAMILIES = {"neg_p3_vs_p1", "pos_p3_vs_p1", "rq2_magnitude"}
+    emm_specs = {
+        ("Negative", 0): {"Intercept": 1},
+        ("Negative", 1): {"Intercept": 1, f"{position}[T.1]": 1},
+        ("Negative", 2): {"Intercept": 1, f"{position}[T.2]": 1},
+        ("Negative", 3): {"Intercept": 1, f"{position}[T.3]": 1},
+        ("Positive", 0): {"Intercept": 1, scenario: 1},
+        ("Positive", 1): {"Intercept": 1, f"{position}[T.1]": 1, scenario: 1, f"{position}[T.1]:{scenario}": 1},
+        ("Positive", 2): {"Intercept": 1, f"{position}[T.2]": 1, scenario: 1, f"{position}[T.2]:{scenario}": 1},
+        ("Positive", 3): {"Intercept": 1, f"{position}[T.3]": 1, scenario: 1, f"{position}[T.3]:{scenario}": 1},
+    }
 
-    log.info("--- Model 5: Does gender moderate the interaction effect? ---")
-    log.info("RQ: Is the interaction between spoiler position and scenario different for different cycling confidences?")
-    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_confidence)"
-    model_5_moderation = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    covariates = ["Gender", "Age", "Cycling_confidence",
+                  "Cycling_frequency", "Cycling_purpose", "Cycling_environment"]
 
-    # --- Model 6: Three-Way Interaction Model (Moderation) ---
-    log.info("--- Model 6: Does gender moderate the interaction effect? ---")
-    log.info("RQ: Is the interaction between spoiler position and scenario different for different cycling frequences?")
-    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_frequency)"
-    model_6_moderation = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    all_contrasts = []
 
-    # --- Model 7: Three-Way Interaction Model (Moderation) ---
-    log.info("--- Model 7: Does gender moderate the interaction effect? ---")
-    log.info("RQ: Is the interaction between spoiler position and scenario different for different cycling purposes?")
-    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Cycling_purpose)"
-    model_7_moderation = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+    for OUTCOME in ["valence", "arousal"]:
+        log.info(f"\n{'=' * 50}\n{OUTCOME.upper()}\n{'=' * 50}")
+        peak, neg, end = f"pos_peak_{OUTCOME}", f"neg_peak_{OUTCOME}", f"end_{OUTCOME}"
 
-    # --- Model 8: Three-Way Interaction Model (Moderation) ---
-    log.info("--- Model 8: Does gender moderate the interaction effect? ---")
-    log.info("RQ: Is the interaction between spoiler position and scenario different for different Genders?")
-    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Gender)"
-    model_8_moderation = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+        raw = df_combined.apply(
+            lambda r: r[f"pos{int(r['spoiler_position'])}_{OUTCOME}"]
+            if r['spoiler_position'] > 0 else np.nan, axis=1)
+        df_combined[f"spoiler_{OUTCOME}_cb"] = (
+                raw - raw.groupby(df_combined["scenario"]).transform("mean")
+        ).fillna(0.0)
 
-    # --- Model 9: Three-Way Interaction Model (Moderation) ---
-    log.info("--- Model 9: Does gender moderate the interaction effect? ---")
-    log.info("RQ: Is the interaction between spoiler position and scenario different for different Age groups?")
-    formula = "valence ~ C(spoiler_position) * C(scenario) * C(Gender)"
-    model_9_moderation = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
+        # ==================================================================
+        # STAGE 2 — Task 2 two-segment order effect (RQ1)
+        # ==================================================================
+        m_task2 = utils.lmm_utils.run_lmm(
+            df=df_two, formula=f"{OUTCOME} ~ C(pair)",
+            groups_col=c.PARTICIPANT_ID, convergence_method='powell')
+        order_ct = utils.lmm_utils.lmm_contrast(
+            m_task2, {"C(pair)[T.NB → B]": 1, "C(pair)[T.B → NB]": -1})
+        all_contrasts.append({
+            "task": "Task 2 (order)", "outcome": OUTCOME,
+            "contrast": "NB_to_B_vs_B_to_NB", "family": "planned",
+            "p_holm": pd.NA, **order_ct})
 
-    # ------------------------------------------------------------------------------
-    # PART 3: PERFORM SEQUENTIAL LIKELIHOOD RATIO TESTS
-    # ------------------------------------------------------------------------------
-    log.info("\n--- Running sequential model comparisons ---")
+        # ==================================================================
+        # STAGE 3 — Task 3 pooled position × scenario (RQ1/RQ2/RQ3)
+        # PRIMARY model: no spoiler covariate. All reported contrasts/EMMs
+        # come from m_inter. One optimizer ('powell') for all LR pairs.
+        # ==================================================================
+        # PRIMARY models (both include the covariate -> valid LR test)
+        m_main = utils.lmm_utils.run_lmm(
+            df=df_combined,
+            formula=f"{OUTCOME} ~ C(spoiler_position) + C(scenario) + spoiler_{OUTCOME}_cb",
+            groups_col=c.PARTICIPANT_ID, convergence_method='powell')
+        m_inter = utils.lmm_utils.run_lmm(
+            df=df_combined,
+            formula=f"{OUTCOME} ~ C(spoiler_position) * C(scenario) + spoiler_{OUTCOME}_cb",
+            groups_col=c.PARTICIPANT_ID, convergence_method='powell')
 
-    log.info("\n--- Comparison: Model 1 (Main Effects) vs. Model 2 (Interaction) ---")
-    utils.lmm_utils.lr_test_mixed(model_1_additive, model_2_interactive)
+        rq3 = utils.helper_functions.lr_test(m_main, m_inter, label=f"RQ3 omnibus ({OUTCOME})")
+        log.info(f"RQ3 omnibus (main vs interaction): {rq3}")
 
-    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 3 (Random Slopes) ---")
-    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_3_slopes)
+        # Sensitivity now runs the OTHER way: does dropping the covariate change anything?
+        m_inter_nocov = utils.lmm_utils.run_lmm(
+            df=df_combined,
+            formula=f"{OUTCOME} ~ C(spoiler_position) * C(scenario)",
+            groups_col=c.PARTICIPANT_ID, convergence_method='powell')
+        keep = [p for p in m_inter.params.index if "spoiler_position" in p or "scenario" in p]
+        pd.DataFrame({
+            "primary (covariate-adjusted)": m_inter.params[keep],
+            "unadjusted": m_inter_nocov.params.reindex(keep),
+        }).to_csv(output_dir / f"spoiler_covariate_sensitivity_{OUTCOME}.csv")
 
-    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 4 (Moderation) ---")
-    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_4_moderation)
+        # Planned + descriptive contrasts (Holm within planned family), all on m_inter
+        planned_pvals, planned_idx = [], []
+        for name, spec in contrast_specs.items():
+            ct = utils.lmm_utils.lmm_contrast(m_inter, spec)
+            is_planned = name in PLANNED_FAMILIES
+            all_contrasts.append({
+                "task": "Task 3", "outcome": OUTCOME, "contrast": name,
+                "family": "planned" if is_planned else "descriptive",
+                "p_holm": pd.NA, **ct})
+            if is_planned:
+                planned_pvals.append(ct["p"])
+                planned_idx.append(len(all_contrasts) - 1)
+        if planned_pvals:
+            for i, ph in zip(planned_idx, multipletests(planned_pvals, method='holm')[1]):
+                all_contrasts[i]["p_holm"] = ph
 
-    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 5 (Moderation) ---")
-    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_5_moderation)
+        # EMMs for the interaction plot
+        emm_df = pd.DataFrame([
+            {"outcome": OUTCOME, "block": block, "position": pos,
+             "emm": (ct := utils.lmm_utils.lmm_contrast(m_inter, spec))["estimate"],
+             "ci_low": ct["ci_low"], "ci_high": ct["ci_high"]}
+            for (block, pos), spec in emm_specs.items()])
+        emm_df.to_csv(output_dir / f"EMM_table_{OUTCOME}.csv", index=False)
+        utils.plotting_utils.plot_emm_interaction(emm_df, OUTCOME, output_dir, log)
 
-    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 6 (Moderation) ---")
-    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_6_moderation)
+        # ==================================================================
+        # STAGE 4 — Aggregation rules: AIC/BIC + recency tests
+        # ==================================================================
+        m_additive = utils.lmm_utils.run_lmm(
+            df=df_combined, formula=f"{OUTCOME} ~ mean_{OUTCOME}",
+            groups_col=c.PARTICIPANT_ID, convergence_method='powell')
+        m_seq = utils.lmm_utils.run_lmm(
+            df=df_combined, formula=f"{OUTCOME} ~ pos1_{OUTCOME} + pos2_{OUTCOME} + pos3_{OUTCOME}",
+            groups_col=c.PARTICIPANT_ID, convergence_method='powell')
+        m_peak_end = utils.lmm_utils.run_lmm(
+            df=df_combined, formula=f"{OUTCOME} ~ {peak} + {neg} + {end}",
+            groups_col=c.PARTICIPANT_ID, convergence_method='powell')
+        m_min_end = utils.lmm_utils.run_lmm(
+            df=df_combined, formula=f"{OUTCOME} ~ {neg} + {end}",
+            groups_col=c.PARTICIPANT_ID, convergence_method='powell')
 
-    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 7 (Moderation) ---")
-    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_7_moderation)
+        pd.DataFrame({
+            "Outcome": OUTCOME,
+            "Model": ["Additive (mean-value)", "Sequential (positional-value)",
+                      "Peak-End (Sym)", "Minimum-End"],
+            "AIC": [m_additive.aic, m_seq.aic, m_peak_end.aic, m_min_end.aic],
+            "BIC": [m_additive.bic, m_seq.bic, m_peak_end.bic, m_min_end.bic],
+        }).sort_values("AIC").to_csv(output_dir / f'stage4_model_comparison_{OUTCOME}.csv', index=False)
 
-    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 8 (Moderation) ---")
-    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_8_moderation)
+        # Recency: Additive is m_seq with b1=b2=b3 (mean = sum/3, same fit) -> direct LR test,
+        # plus pairwise weight contrasts. This is THE test of the recency claim.
+        recency_out = pd.DataFrame([
+            utils.helper_functions.lr_test(m_additive, m_seq, label="equal-weights vs sequential"),
+            utils.helper_functions.wald_contrast(m_seq, {f"pos3_{OUTCOME}": 1, f"pos1_{OUTCOME}": -1}, "b3 - b1"),
+            utils.helper_functions.wald_contrast(m_seq, {f"pos3_{OUTCOME}": 1, f"pos2_{OUTCOME}": -1}, "b3 - b2"),
+            utils.helper_functions.wald_contrast(m_seq, {f"pos2_{OUTCOME}": 1, f"pos1_{OUTCOME}": -1}, "b2 - b1"),
+        ])
+        recency_out.to_csv(output_dir / f"recency_tests_{OUTCOME}.csv", index=False)
+        log.info(f"\nRecency tests ({OUTCOME}):\n{recency_out.to_string(index=False)}")
 
-    log.info("\n--- Comparison: Model 2 (Interaction) vs. Model 9 (Moderation) ---")
-    utils.lmm_utils.lr_test_mixed(model_2_interactive, model_9_moderation)
+        # ==================================================================
+        # STAGE 4b — LOPO CV with paired comparison
+        # ==================================================================
+        cv_formulas = {
+            "Additive (mean-value)": f"{OUTCOME} ~ mean_{OUTCOME}",
+            "Sequential (positional-value)": f"{OUTCOME} ~ pos1_{OUTCOME} + pos2_{OUTCOME} + pos3_{OUTCOME}",
+            "Peak-End (Sym)": f"{OUTCOME} ~ {peak} + {neg} + {end}",
+            "Minimum-End": f"{OUTCOME} ~ {neg} + {end}",
+        }
+        cv_fold_rmse = {name: {} for name in cv_formulas}
+        for held_out in df_combined[c.PARTICIPANT_ID].unique():
+            train = df_combined[df_combined[c.PARTICIPANT_ID] != held_out]
+            test = df_combined[df_combined[c.PARTICIPANT_ID] == held_out]
+            for name, formula in cv_formulas.items():
+                try:
+                    m_cv = utils.lmm_utils.run_lmm(df=train, formula=formula,
+                                                   groups_col=c.PARTICIPANT_ID,
+                                                   convergence_method='powell')
+                    resid = test[OUTCOME].to_numpy() - np.asarray(m_cv.predict(exog=test))
+                    cv_fold_rmse[name][held_out] = float(np.sqrt(np.mean(resid ** 2)))
+                except Exception as e:
+                    log.warning(f"CV fold (p={held_out}, {name}) failed: {e}")
 
-    # ------------------------------------------------------------------------------
-    # Part 4: Testing Alternative Explanations
-    # ------------------------------------------------------------------------------
-    log.info("\n--- Model 5: Is it about quantity, not position? ---")
-    log.info("RQ: Can valence be explained simply by the number of spoilers in the sequence?")
+        fold_df = pd.DataFrame(cv_fold_rmse).dropna()
+        summary = fold_df.mean().sort_values().rename("mean_fold_RMSE").to_frame()
+        best = summary.index[0]
+        rows = []
+        for other in [m for m in fold_df.columns if m != best]:
+            diff = fold_df[other] - fold_df[best]
+            W, p = stats.wilcoxon(diff)
+            rows.append({"best": best, "vs": other,
+                         "median_RMSE_diff": float(diff.median()),
+                         "W": float(W), "p_raw": float(p)})
+        pairs = pd.DataFrame(rows)
+        pairs["p_holm"] = multipletests(pairs["p_raw"], method="holm")[1]
+        log.info(f"\nStage 4b paired CV ({OUTCOME}):\n{summary.to_string()}\n{pairs.to_string(index=False)}")
+        summary.to_csv(output_dir / f"stage4b_cv_summary_{OUTCOME}.csv")
+        pairs.to_csv(output_dir / f"stage4b_cv_paired_tests_{OUTCOME}.csv", index=False)
 
-    formula = "valence ~ C(NB_count)"
-    quantity_model = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        convergence_method='cg'
-    )
-
-    log.info("\n--- Model 6: Testing the Peak-Valence Heuristic ---")
-    log.info("RQ: Is the valence rating driven by the most emotionally intense moment (positive or negative peak)?")
-
-    formula = "valence ~ pos_peak_valence + neg_peak_valence + end_valence"
-    re_formula = '~ C(scenario)'
-    heuristic_model = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=formula,
-        groups_col=c.PARTICIPANT_ID,
-        re_formula=re_formula,
-        convergence_method='powell'
-    )
-
-    # ==============================================================================
-    # PART 2: PERFORM AKAIKE and BIKAIKE COMPARISONS
-    # ==============================================================================
-
-    log.info("\n--- Creating a Baseline (Intercept-Only) Model ---")
-    baseline_formula = "valence ~ 1"
-    baseline_model = utils.lmm_utils.run_lmm(
-        df=df_combined,
-        formula=baseline_formula,
-        groups_col=c.PARTICIPANT_ID
-    )
-
-    # --- Compare the best models from each theory using AIC/BIC ---
-    best_positional_model = model_2_interactive
-
-    log.info("\n--- Final Model Comparison (Lower AIC/BIC is Better) ---")
-    log.info(f"Intercept only Model AIC: {baseline_model.aic:.2f}, BIC: {baseline_model.bic:.2f}")
-    log.info(f"Positional Model AIC: {best_positional_model.aic:.2f}, BIC: {best_positional_model.bic:.2f}")
-    log.info(f"Quantity Model AIC:   {quantity_model.aic:.2f}, BIC: {quantity_model.bic:.2f}")
-    log.info(f"Heuristic Model AIC:  {heuristic_model.aic:.2f}, BIC: {heuristic_model.bic:.2f}")
-
-
+        # ==================================================================
+        # STAGE 5 — Covariate robustness (LR vs the PRIMARY model)
+        # ==================================================================
+        base_formula = f"{OUTCOME} ~ C(spoiler_position) * C(scenario) + spoiler_{OUTCOME}_cb"
+        cov_rows = []
+        for cov in covariates:
+            if cov not in df_combined.columns:
+                continue
+            sub = df_combined.dropna(subset=[cov])
+            if sub[cov].nunique() < 2:
+                log.warning(f"{cov}: <2 levels — skipping.")
+                continue
+            m_ref = (m_inter if len(sub) == len(df_combined)
+                     else utils.lmm_utils.run_lmm(df=sub, formula=base_formula,
+                                                  groups_col=c.PARTICIPANT_ID,
+                                                  convergence_method='powell'))
+            m_cov = utils.lmm_utils.run_lmm(
+                df=sub, formula=f"{base_formula} + C({cov})",
+                groups_col=c.PARTICIPANT_ID, convergence_method='powell')
+            res = utils.helper_functions.lr_test(m_ref, m_cov, label=cov)
+            if res["note"]:
+                log.error(f"Stage 5 ({OUTCOME}, {cov}): {res['note']}")
+            cov_rows.append({"outcome": OUTCOME, "covariate": cov, **res})
+        if cov_rows:
+            cov_df = pd.DataFrame(cov_rows)
+            valid = cov_df["p"].notna()
+            cov_df.loc[valid, "p_holm"] = multipletests(cov_df.loc[valid, "p"], method='holm')[1]
+            log.info(f"\nStage 5 covariates ({OUTCOME}):\n{cov_df.to_string(index=False)}")
+            cov_df.to_csv(output_dir / f'stage5_covariates_{OUTCOME}.csv', index=False)
 
 if __name__ == "__main__":
     main()
