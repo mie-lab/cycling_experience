@@ -62,19 +62,14 @@ def compute_k_rmse(X, video_df, target_col=c.VALENCE):
 
 
 
-def predict_candidates(X, video_df, candidate_df, feature_cols, target_col, k, id_col=c.VIDEO_ID_COL, negate=False):
+def predict_candidates(X, video_df, candidate_df, feature_cols, target_col, k,
+                       id_col=c.VIDEO_ID_COL, pred_col='valence_prediction', negate=False):
     """
-    Predict valence for candidate videos using k-NN trained on existing video data.
-    :param X: feature DataFrame for training videos
-    :param video_df: DataFrame with training video data
-    :param candidate_df: DataFrame with candidate video data
-    :param feature_cols: list of feature columns to use
-    :param target_col: name of the target column
-    :param k: number of neighbors
-    :param id_col: name of the ID column
-    :param negate: whether to negate predictions
-    :return: DataFrame with candidate IDs and predicted valence
+    Predict `target_col` for candidate videos using k-NN trained on existing video data.
+    :param pred_col: name of the output prediction column
+                     (defaults to f"{target_col}_prediction")
     """
+    pred_col = pred_col or f"{target_col}_prediction"
     knn = KNeighborsRegressor(n_neighbors=k, weights='distance', metric='manhattan')
     knn.fit(X, video_df.loc[X.index, target_col])
 
@@ -83,10 +78,11 @@ def predict_candidates(X, video_df, candidate_df, feature_cols, target_col, k, i
         pred = knn.predict(candidate_df.loc[vid, feature_cols].to_frame().T)[0]
         if negate:
             pred = -pred
-        rows.append({id_col: candidate_df.loc[vid, id_col], 'valence_prediction': pred})
+        rows.append({id_col: candidate_df.loc[vid, id_col], pred_col: pred})
 
-    results_df = (pd.DataFrame(rows).sort_values(by='valence_prediction', ascending=False).reset_index(drop=True)
-                  )
+    results_df = (pd.DataFrame(rows)
+                  .sort_values(by=pred_col, ascending=False)
+                  .reset_index(drop=True))
     return results_df
 
 
