@@ -1,4 +1,6 @@
 from pathlib import Path
+import re
+
 import numpy as np
 import pandas as pd
 import neurokit2 as nk
@@ -939,3 +941,50 @@ def summarize_physio_data_coverage(
         print(physio_summary.round(2).to_string(index=False))
 
     return physio_summary
+
+
+def _block_of(code):
+    return "DJI" if code.startswith("DJI") else code.split("_")[0]
+
+
+def get_physio_trial_df(df_physio, experiment_setup, trial_label, metrics=None):
+    """
+    One physiology value per sequence, keyed by presentation order:
+    physio segment_id k == the k-th column of the participant's setup row
+    (same ordering the ratings use). Keeps the columns belonging to `trial_label`.
+
+    Returns: participant_id, sequence_code (e.g. '3_2'), + metric columns.
+    """
+    rows = []
+    have = set(df_physio[c.PARTICIPANT_ID].unique())
+    for pid in experiment_setup.index:
+        if pid not in have:
+            continue
+        setup_row = experiment_setup.loc[pid]
+        psub = df_physio[df_physio[c.PARTICIPANT_ID] == pid].set_index("segment_id")
+        for col_idx, fname in enumerate(setup_row):
+            if pd.isna(fname):
+                continue
+            code = re.sub(r"\.mp4$|\.MP4$", "", fname)
+            if _block_of(code) != trial_label:
+                continue
+            if col_idx not in psub.index:
+                continue
+            rows.append({c.PARTICIPANT_ID: pid, "sequence_code": code,
+                         **psub.loc[col_idx][metrics].to_dict()})
+    return pd.DataFrame(rows)
+
+
+def physio_missing_by_participant(frames, metric="SCL_Delta"):
+    rows = []
+    for block_name, d in frames.items():
+        miss = (d.groupby(c.PARTICIPANT_ID)[metric]
+                  .agg(n="size", n_missing=lambda s: s.isna().sum()))
+        miss["block"] = block_name
+        rows.append(miss.reset_index())
+    long = pd.concat(rows, ignore_index=True)
+    # wide: one row per participant, missing-count per block
+    wide = long.pivot_table(index=c.PARTICIPANT_ID, columns="block",
+                            values="n_missing", fill_value=0).astype(int)
+    wide["total_missing"] = wide.sum(axis=1)
+    return wide.sort_values("total_missing", ascending=False)
