@@ -1,6 +1,5 @@
 from __future__ import annotations
 from scipy.spatial import ConvexHull
-from matplotlib.patches import Patch
 import matplotlib.patches as mpatches
 from collections import Counter
 from PIL import Image
@@ -14,15 +13,13 @@ from scipy.stats import ttest_ind
 from pathlib import Path
 import pandas as pd
 from adjustText import adjust_text
-import matplotlib.colors as mcolors
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
-import matplotlib.pyplot as plt
-import seaborn as sns
+import scipy.stats as _sps
+from pathlib import Path
+from typing import Optional, Sequence, Tuple
 import numpy as np
-from matplotlib.patches import Patch
-import matplotlib.colors as mcolors
-import textwrap
+import pandas as pd
 
 
 # ---  Plotting functions for survey data analysis ---
@@ -2047,113 +2044,6 @@ def plot_violin_trend_panels(
         plt.show()
 
 
-from pathlib import Path
-from typing import Optional, Sequence, Tuple
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-
-def plot_sequence_trend_panels(
-    df: pd.DataFrame,
-    sequence_order: Optional[list[str]] = None,
-    metrics: Sequence[Tuple[str, Tuple[float, float], str]] = (
-        ("valence", (-1, 1), "Valence"),
-        ("arousal", (-1, 1), "Arousal"),
-    ),
-    estimator: str = "median",   # "mean" or "median"
-    ci: int = 95,
-    n_boot: int = 2000,
-    seed: int = 42,
-    palette_name: str = "Set2",
-    raw_alpha: float = 0.35,
-    raw_size: float = 22,        # scatter size (points^2)
-    jitter: float = 0.22,        # horizontal jitter only (honest)
-    line_color: str = "0.45",    # grey
-    line_width: float = 1.6,
-    save_path: Optional[Path] = None,
-) -> None:
-    d = df.copy()
-    d["sequence_type"] = d["sequence_list"].apply(lambda s: " → ".join(map(str, s)))
-    rng = np.random.default_rng(seed)
-
-    order = (
-        [s for s in sequence_order if s in set(d["sequence_type"].dropna().unique())]
-        if sequence_order else sorted(d["sequence_type"].dropna().unique())
-    )
-    palette = dict(zip(order, sns.color_palette(palette_name, len(order))))
-
-    est_fn = np.median if estimator == "median" else np.mean
-    lo_q, hi_q = (100 - ci) / 2, 100 - (100 - ci) / 2
-
-    def boot_ci(x: np.ndarray) -> tuple[float, float, float]:
-        x = np.asarray(x, float)
-        x = x[np.isfinite(x)]
-        if x.size == 0:
-            return np.nan, np.nan, np.nan
-        c = float(est_fn(x))
-        if x.size == 1:
-            return c, c, c
-        idx = rng.integers(0, x.size, size=(n_boot, x.size))
-        boots = np.apply_along_axis(est_fn, 1, x[idx])
-        lo, hi = np.percentile(boots, [lo_q, hi_q])
-        return c, float(lo), float(hi)
-
-    fig, axes = plt.subplots(1, len(metrics), figsize=(6.6 * len(metrics), 5.2), sharex=True)
-    axes = np.atleast_1d(axes)
-
-    x = np.arange(len(order))
-
-    for ax, (m, ylim, title) in zip(axes, metrics):
-        dd = d[["sequence_type", m]].dropna()
-        dd = dd[dd["sequence_type"].isin(order)]
-
-        # raw points (colored by sequence) — matplotlib scatter is leaner than seaborn here
-        for i, seq in enumerate(order):
-            y = dd.loc[dd["sequence_type"] == seq, m].to_numpy(dtype=float)
-            xj = x[i] + rng.uniform(-jitter, jitter, size=y.size)
-            ax.scatter(xj, y, s=raw_size, color=palette[seq], alpha=raw_alpha, edgecolors="none", zorder=1)
-
-        # summary + CI
-        centers, lows, highs = [], [], []
-        for seq in order:
-            c, lo, hi = boot_ci(dd.loc[dd["sequence_type"] == seq, m].to_numpy())
-            centers.append(c); lows.append(lo); highs.append(hi)
-
-        centers = np.array(centers, float)
-        lows = np.array(lows, float)
-        highs = np.array(highs, float)
-
-        # dashed grey line
-        ax.plot(x, centers, "--", color=line_color, lw=line_width, zorder=3)
-
-        # CI bars + white marker with colored ring
-        yerr = np.vstack([centers - lows, highs - centers])
-        ax.errorbar(x, centers, yerr=yerr, fmt="o", ms=9,
-                    mfc="white", mec="black", mew=1.2,
-                    ecolor="black", elinewidth=2.0, capsize=7, zorder=4)
-
-        ax.scatter(x, centers, s=160, facecolors="none",
-                   edgecolors=[palette[s] for s in order], linewidths=2.0, zorder=5)
-
-        ax.set_title(title)
-        ax.set_ylabel(title)
-        ax.set_xlabel("Sequence order")
-        ax.set_ylim(*ylim)
-        ax.set_xticks(x)
-        ax.set_xticklabels(order, ha="right")
-        ax.grid(True, axis="y", alpha=0.25)
-
-    fig.suptitle(f"Trend across sequences ({estimator}, bootstrap {ci}% CI)", fontsize=15, y=1.02)
-    fig.tight_layout()
-
-    if save_path:
-        fig.savefig(save_path, dpi=250, bbox_inches="tight")
-        plt.close(fig)
-    else:
-        plt.show()
-
 def plot_sequence_trends_across_scenarios(
     df_list: list[pd.DataFrame],
     scenario_labels: list[str],
@@ -2953,6 +2843,210 @@ def plot_transposed_scenario_heatmap(
     else:
         plt.show()
 
+# Lab study style
+
+_CAT_A = "#41b6c4"   # light teal  -> "Positive" block / first category
+_CAT_B = "#253494"   # dark blue   -> "Negative" block / second category
+_FS_LABEL = 14
+_FS_TITLE = 15
+_FS_TICK = 12
+_FS_ANNOT = 11
+
+
+def plot_bland_altman(
+    df: pd.DataFrame,
+    measurement1: str,
+    measurement2: str,
+    label_col: str,
+    save_path: Optional[Path] = None
+) -> dict:
+    """
+    Bland-Altman plot comparing two measurements. Returns the agreement
+    statistics (bias and 95% limits of agreement) so they can be tabled.
+    """
+    df_agree = df.dropna(subset=[measurement1, measurement2]).copy()
+    avg_col = 'average_score'
+    diff_col = 'difference_score'
+    df_agree[avg_col] = (df_agree[measurement1] + df_agree[measurement2]) / 2
+    df_agree[diff_col] = df_agree[measurement1] - df_agree[measurement2]
+
+    mean_diff = df_agree[diff_col].mean()
+    std_diff = df_agree[diff_col].std()
+    upper_loa = mean_diff + 1.96 * std_diff
+    lower_loa = mean_diff - 1.96 * std_diff
+
+    point_color = plt.get_cmap("YlGnBu")(0.65)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(df_agree[avg_col], df_agree[diff_col], s=70, alpha=0.85,
+               color=point_color, edgecolor="white", linewidth=0.8, zorder=3)
+
+    for _, row in df_agree.iterrows():
+        ax.text(row[avg_col], row[diff_col], str(row[label_col]),
+                fontsize=_FS_ANNOT, ha='center', va='bottom', zorder=4)
+
+    ax.axhline(mean_diff, color="#d62728", linestyle='--', lw=1.5, label='Mean difference (bias)')
+    ax.axhline(upper_loa, color='0.5', linestyle='--', lw=1.2, label='95% limits of agreement')
+    ax.axhline(lower_loa, color='0.5', linestyle='--', lw=1.2)
+
+    title1 = measurement1.replace('_', ' ').title()
+    title2 = measurement2.replace('_', ' ').title()
+    ax.set_title(f'Bland–Altman: {title1} vs. {title2}', fontsize=_FS_TITLE, fontweight="bold")
+    ax.set_xlabel('Average of scores', fontsize=_FS_LABEL)
+    ax.set_ylabel(f'Difference ({measurement1} − {measurement2})', fontsize=_FS_LABEL)
+    ax.tick_params(labelsize=_FS_TICK)
+    ax.legend(fontsize=_FS_TICK)
+    ax.grid(True, alpha=0.3)
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Bland-Altman plot saved to {save_path}")
+    else:
+        plt.show()
+
+    return {'n': len(df_agree), 'bias': mean_diff,
+            'lower_loa': lower_loa, 'upper_loa': upper_loa, 'sd_diff': std_diff}
+
+
+def plot_clip_affect_space(
+    df: pd.DataFrame,
+    valence_col: str = "valence",
+    arousal_col: str = "arousal",
+    id_col: str = c.VIDEO_ID_COL,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    Scatter of clip-level mean valence/arousal (centroids) on the Affect Grid (Stage 1).
+    """
+    d = df.dropna(subset=[valence_col, arousal_col]).copy()
+    point_color = plt.get_cmap("YlGnBu")(0.65)
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    for gv in np.arange(-1, 1 + 1e-9, 0.2):
+        ax.axhline(gv, color="lightgrey", lw=0.8, zorder=0)
+        ax.axvline(gv, color="lightgrey", lw=0.8, zorder=0)
+    ax.axhline(0, color="darkgrey", lw=1.2, zorder=1)
+    ax.axvline(0, color="darkgrey", lw=1.2, zorder=1)
+
+    ax.scatter(d[valence_col], d[arousal_col], s=110,
+               color=point_color, edgecolor="white", linewidth=0.9, zorder=3)
+    for _, r in d.iterrows():
+        ax.text(r[valence_col], r[arousal_col], str(int(r[id_col])),
+                fontsize=_FS_ANNOT, ha="center", va="center", zorder=4, color="#222")
+
+    ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Valence [-1, 1]", fontsize=_FS_LABEL)
+    ax.set_ylabel("Arousal [-1, 1]", fontsize=_FS_LABEL)
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title("Clip-level affect (lab centroids)", fontsize=_FS_TITLE, fontweight="bold")
+
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_sequence_trend_panels(
+    df: pd.DataFrame,
+    sequence_order: Optional[list[str]] = None,
+    metrics: Sequence[Tuple[str, Tuple[float, float], str]] = (
+        ("valence", (-1, 1), "Valence"),
+        ("arousal", (-1, 1), "Arousal"),
+    ),
+    estimator: str = "median",
+    ci: int = 95,
+    n_boot: int = 2000,
+    seed: int = 42,
+    raw_alpha: float = 0.35,
+    raw_size: float = 22,
+    jitter: float = 0.22,
+    line_color: str = "0.45",
+    line_width: float = 1.6,
+    save_path: Optional[Path] = None,
+) -> None:
+    """
+    Per-sequence trend with bootstrap CI. Raw points are colored along the
+    YlGnBu ramp by sequence position so every panel shares one identity.
+    """
+    d = df.copy()
+    d["sequence_type"] = d["sequence_list"].apply(lambda s: " \u2192 ".join(map(str, s)))
+    rng = np.random.default_rng(seed)
+
+    order = (
+        [s for s in sequence_order if s in set(d["sequence_type"].dropna().unique())]
+        if sequence_order else sorted(d["sequence_type"].dropna().unique())
+    )
+    # color sequences along the YlGnBu ramp (0.30 -> 0.90 keeps them visible)
+    ramp = np.linspace(0.30, 0.90, max(len(order), 1))
+    palette = {seq: plt.get_cmap("YlGnBu")(t) for seq, t in zip(order, ramp)}
+
+    est_fn = np.median if estimator == "median" else np.mean
+    lo_q, hi_q = (100 - ci) / 2, 100 - (100 - ci) / 2
+
+    def boot_ci(x: np.ndarray):
+        x = np.asarray(x, float); x = x[np.isfinite(x)]
+        if x.size == 0:
+            return np.nan, np.nan, np.nan
+        cc = float(est_fn(x))
+        if x.size == 1:
+            return cc, cc, cc
+        idx = rng.integers(0, x.size, size=(n_boot, x.size))
+        boots = np.apply_along_axis(est_fn, 1, x[idx])
+        lo, hi = np.percentile(boots, [lo_q, hi_q])
+        return cc, float(lo), float(hi)
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6.6 * len(metrics), 5.2), sharex=True)
+    axes = np.atleast_1d(axes)
+    x = np.arange(len(order))
+
+    for ax, (m, ylim, title) in zip(axes, metrics):
+        dd = d[["sequence_type", m]].dropna()
+        dd = dd[dd["sequence_type"].isin(order)]
+
+        for i, seq in enumerate(order):
+            y = dd.loc[dd["sequence_type"] == seq, m].to_numpy(dtype=float)
+            xj = x[i] + rng.uniform(-jitter, jitter, size=y.size)
+            ax.scatter(xj, y, s=raw_size, color=palette[seq], alpha=raw_alpha,
+                       edgecolors="none", zorder=1)
+
+        centers, lows, highs = [], [], []
+        for seq in order:
+            cc, lo, hi = boot_ci(dd.loc[dd["sequence_type"] == seq, m].to_numpy())
+            centers.append(cc); lows.append(lo); highs.append(hi)
+        centers = np.array(centers, float); lows = np.array(lows, float); highs = np.array(highs, float)
+
+        ax.plot(x, centers, "--", color=line_color, lw=line_width, zorder=3)
+        yerr = np.vstack([centers - lows, highs - centers])
+        ax.errorbar(x, centers, yerr=yerr, fmt="o", ms=9,
+                    mfc="white", mec="black", mew=1.2,
+                    ecolor="black", elinewidth=2.0, capsize=7, zorder=4)
+        ax.scatter(x, centers, s=160, facecolors="none",
+                   edgecolors=[palette[s] for s in order], linewidths=2.0, zorder=5)
+
+        ax.set_title(title, fontsize=_FS_TITLE)
+        ax.set_ylabel(title, fontsize=_FS_LABEL)
+        ax.set_xlabel("Sequence order", fontsize=_FS_LABEL)
+        ax.set_ylim(*ylim)
+        ax.set_xticks(x)
+        ax.set_xticklabels(order, ha="right", fontsize=_FS_TICK)
+        ax.tick_params(axis="y", labelsize=_FS_TICK)
+        ax.grid(True, axis="y", alpha=0.25)
+
+    fig.suptitle(f"Trend across sequences ({estimator}, bootstrap {ci}% CI)",
+                 fontsize=_FS_TITLE + 1, y=1.02)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
 
 def plot_ranking_distribution(
     df: pd.DataFrame,
@@ -2962,8 +3056,9 @@ def plot_ranking_distribution(
     save_path: Optional[Path] = None,
 ) -> None:
     """
-    Stacked proportion bars: for each sequence, the share of participants
-    assigning each rank (1 = best ... 4 = worst). For ordinal repeated rankings.
+    Stacked proportion bars: per sequence, share of participants assigning each
+    rank (1 = best ... 4 = worst). Diverging RdYlGn_r is the correct role for an
+    ordinal best->worst scale (green = best, red = worst).
     """
     d = df[[pair_col, ranking_col]].dropna().copy()
     d[ranking_col] = d[ranking_col].astype(int)
@@ -2976,7 +3071,7 @@ def plot_ranking_distribution(
              .unstack(fill_value=0).reindex(index=order, columns=ranks, fill_value=0))
     pct = tab.div(tab.sum(axis=1), axis=0) * 100
 
-    colors = sns.color_palette("RdYlGn_r", n_colors=len(ranks))  # rank 1 green, 4 red
+    colors = sns.color_palette("RdYlGn_r", n_colors=len(ranks))
     fig, ax = plt.subplots(figsize=(7, 5))
     bottom = np.zeros(len(order))
     for i, r in enumerate(ranks):
@@ -2985,30 +3080,33 @@ def plot_ranking_distribution(
         for j, (v, b) in enumerate(zip(vals, bottom)):
             if v >= 6:
                 ax.text(j, b + v / 2, f"{v:.0f}", ha="center", va="center",
-                        fontsize=10, color="black")
+                        fontsize=_FS_TICK, color="black")
         bottom += vals
 
-    ax.set_ylabel("Participants (%)")
-    ax.set_xlabel("Sequence")
+    ax.set_ylabel("Participants (%)", fontsize=_FS_LABEL)
+    ax.set_xlabel("Sequence", fontsize=_FS_LABEL)
     ax.set_ylim(0, 100)
-    ax.set_title("Recalled ranking distribution by sequence")
-    ax.legend(title="Rank (1 = best)", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.tick_params(labelsize=_FS_TICK)
+    ax.set_title("Recalled ranking distribution by sequence", fontsize=_FS_TITLE, fontweight="bold")
+    ax.legend(title="Rank (1 = best)", bbox_to_anchor=(1.02, 1), loc="upper left",
+              fontsize=_FS_TICK, title_fontsize=_FS_TICK)
     fig.tight_layout()
 
     if save_path:
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
     else:
         plt.show()
 
+
 def plot_ranking_distribution_combined(
-    blocks: list,                # list of (df, title, sequence_order) tuples
+    blocks: list,
     pair_col: str = "sequence_type",
     ranking_col: str = "ranking",
     save_path: Optional[Path] = None,
 ) -> None:
     """
-    Stacked rank-proportion bars for several blocks side by side in one figure.
+    Stacked rank-proportion bars for several blocks side by side.
     Each block: (dataframe, panel_title, sequence_order_list).
     """
     n = len(blocks)
@@ -3016,7 +3114,6 @@ def plot_ranking_distribution_combined(
     if n == 1:
         axes = [axes]
 
-    # consistent rank colors across all panels (rank 1 = green ... rank 4 = red)
     all_ranks = sorted({int(r) for df, _, _ in blocks
                         for r in df[ranking_col].dropna().unique()})
     colors = dict(zip(all_ranks, sns.color_palette("RdYlGn_r", n_colors=len(all_ranks))))
@@ -3036,103 +3133,21 @@ def plot_ranking_distribution_combined(
             ax.bar(range(len(order)), vals, bottom=bottom, color=colors[r], label=f"Rank {r}")
             for j, (v, b) in enumerate(zip(vals, bottom)):
                 if v >= 7:
-                    ax.text(j, b + v / 2, f"{v:.0f}", ha="center", va="center", fontsize=9)
+                    ax.text(j, b + v / 2, f"{v:.0f}", ha="center", va="center", fontsize=_FS_TICK - 1)
             bottom += vals
 
-        ax.set_title(title, fontsize=13)
+        ax.set_title(title, fontsize=_FS_TITLE)
         ax.set_xticks(range(len(order)))
-        ax.set_xticklabels(order, rotation=30, ha="right", fontsize=9)
+        ax.set_xticklabels(order, rotation=30, ha="right", fontsize=_FS_TICK)
+        ax.tick_params(axis="y", labelsize=_FS_TICK)
         ax.set_ylim(0, 100)
-        ax.set_xlabel("Sequence")
+        ax.set_xlabel("Sequence", fontsize=_FS_LABEL)
 
-    axes[0].set_ylabel("Participants (%)")
-    # single shared legend
+    axes[0].set_ylabel("Participants (%)", fontsize=_FS_LABEL)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, title="Rank (1 = best)",
-               bbox_to_anchor=(1.0, 0.9), loc="upper left")
-
-    fig.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-    else:
-        plt.show()
-
-
-def plot_emm_interaction(emm_df, outcome_name, output_dir, log_obj):
-    """
-    Plots the Estimated Marginal Means (EMMs) showing the interaction
-    between sequence type and spoiler position.
-    """
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    colors = {"Positive": "#2ca02c", "Negative": "#d62728"}
-    labels = {"Positive": "Positive Block (NB Spoiler)", "Negative": "Negative Block (B Spoiler)"}
-
-    for block in ["Positive", "Negative"]:
-        subset = emm_df[emm_df["block"] == block]
-
-        lower_error = subset["emm"] - subset["ci_low"]
-        upper_error = subset["ci_high"] - subset["emm"]
-
-        ax.errorbar(
-            subset["position"], subset["emm"], yerr=[lower_error, upper_error],
-            fmt='-o', capsize=5, capthick=1.5, linewidth=2, markersize=8,
-            label=labels[block], color=colors[block]
-        )
-
-    ax.set_xticks([0, 1, 2, 3])
-    ax.set_xticklabels(["Homogeneous\nBaseline", "Spoiler\nPos 1", "Spoiler\nPos 2", "Spoiler\nPos 3"], fontsize=11)
-
-    ax.set_ylim(-1.05, 1.05)
-    ax.axhline(0, color='gray', linestyle='--', linewidth=1, zorder=0)
-
-    ax.set_ylabel(f"Estimated Marginal Mean ({outcome_name.capitalize()})", fontsize=12, fontweight='bold')
-    ax.set_title(f"Interaction of Sequence Type and Spoiler Position on {outcome_name.capitalize()}", fontsize=14)
-    ax.legend(loc="best", frameon=True, fontsize=10)
-
-    plt.tight_layout()
-    plot_path = output_dir / f"task3_EMM_plot_{outcome_name}.png"
-    fig.savefig(plot_path, dpi=300)
-    plt.close(fig)
-
-    log_obj.info(f"Successfully generated and saved EMM plot to {plot_path}")
-
-
-def plot_clip_affect_space(
-    df: pd.DataFrame,
-    valence_col: str = "valence",
-    arousal_col: str = "arousal",
-    id_col: str = c.VIDEO_ID_COL,
-    save_path: Optional[Path] = None,
-) -> None:
-    """
-    Scatter of clip-level mean valence/arousal (centroids) on the Affect Grid (Stage 1).
-    """
-    d = df.dropna(subset=[valence_col, arousal_col]).copy()
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-
-    # Affect Grid backdrop
-    for gv in np.arange(-1, 1 + 1e-9, 0.2):
-        ax.axhline(gv, color="lightgrey", lw=0.8, zorder=0)
-        ax.axvline(gv, color="lightgrey", lw=0.8, zorder=0)
-    ax.axhline(0, color="darkgrey", lw=1.2, zorder=1)
-    ax.axvline(0, color="darkgrey", lw=1.2, zorder=1)
-
-    # Clip centroids
-    ax.scatter(d[valence_col], d[arousal_col], s=90,
-               color="#3376b5", edgecolor="white", linewidth=0.9, zorder=3)
-    for _, r in d.iterrows():
-        ax.text(r[valence_col], r[arousal_col], str(int(r[id_col])),
-                fontsize=7, ha="center", va="center", zorder=4, color="#222")
-
-    ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("Valence [-1, 1]", fontsize=13)
-    ax.set_ylabel("Arousal [-1, 1]", fontsize=13)
-    ax.set_xticks([]); ax.set_yticks([])
-    ax.set_title("Clip-level affect (lab centroids)", fontsize=14, fontweight="bold")
+               bbox_to_anchor=(1.0, 0.9), loc="upper left",
+               fontsize=_FS_TICK, title_fontsize=_FS_TICK)
 
     fig.tight_layout()
     if save_path:
@@ -3140,3 +3155,74 @@ def plot_clip_affect_space(
         plt.close(fig)
     else:
         plt.show()
+
+
+def plot_emm_interaction(emm_df, outcome_name, output_dir, log_obj):
+    """
+    Estimated Marginal Means: interaction of sequence type and spoiler position.
+    Positive/Negative blocks use the two fixed categorical anchors (YlGnBu ends)
+    rather than green/red, matching the rest of the figures.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    colors = {"Positive": _CAT_A, "Negative": _CAT_B}
+    labels = {"Positive": "Positive block (NB spoiler)", "Negative": "Negative block (B spoiler)"}
+
+    for block in ["Positive", "Negative"]:
+        subset = emm_df[emm_df["block"] == block]
+        lower_error = subset["emm"] - subset["ci_low"]
+        upper_error = subset["ci_high"] - subset["emm"]
+        ax.errorbar(
+            subset["position"], subset["emm"], yerr=[lower_error, upper_error],
+            fmt='-o', capsize=5, capthick=1.5, linewidth=2, markersize=8,
+            label=labels[block], color=colors[block]
+        )
+
+    ax.set_xticks([0, 1, 2, 3])
+    ax.set_xticklabels(["Homogeneous\nBaseline", "Spoiler\nPos 1", "Spoiler\nPos 2", "Spoiler\nPos 3"],
+                       fontsize=_FS_TICK)
+    ax.set_ylim(-1.05, 1.05)
+    ax.axhline(0, color='gray', linestyle='--', linewidth=1, zorder=0)
+    ax.set_ylabel(f"Estimated marginal mean ({outcome_name.capitalize()})",
+                  fontsize=_FS_LABEL, fontweight='bold')
+    ax.tick_params(axis="y", labelsize=_FS_TICK)
+    ax.set_title(f"Sequence type \u00d7 spoiler position on {outcome_name.capitalize()}",
+                 fontsize=_FS_TITLE)
+    ax.legend(loc="best", frameon=True, fontsize=_FS_TICK)
+
+    plt.tight_layout()
+    plot_path = output_dir / f"task3_EMM_plot_{outcome_name}.png"
+    fig.savefig(plot_path, dpi=300)
+    plt.close(fig)
+    log_obj.info(f"Successfully generated and saved EMM plot to {plot_path}")
+
+
+def plot_lmm_diagnostics(fitted, title, save_path):
+    """Residual-vs-fitted and Normal QQ for a fitted MixedLM."""
+    resid = np.asarray(fitted.resid)
+    fitvals = np.asarray(fitted.fittedvalues)
+    point_color = plt.get_cmap("YlGnBu")(0.65)
+
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    ax[0].scatter(fitvals, resid, s=14, alpha=.55, color=point_color, edgecolor="none")
+    ax[0].axhline(0, ls="--", c="grey", lw=1)
+    ax[0].set_xlabel("Fitted", fontsize=_FS_LABEL)
+    ax[0].set_ylabel("Residual", fontsize=_FS_LABEL)
+    ax[0].tick_params(labelsize=_FS_TICK)
+    ax[0].set_title(f"{title}: residual vs fitted", fontsize=_FS_TITLE)
+
+    _sps.probplot(resid, dist="norm", plot=ax[1])
+    ax[1].set_title(f"{title}: Normal QQ", fontsize=_FS_TITLE)
+    ax[1].set_xlabel(ax[1].get_xlabel(), fontsize=_FS_LABEL)
+    ax[1].set_ylabel(ax[1].get_ylabel(), fontsize=_FS_LABEL)
+    ax[1].tick_params(labelsize=_FS_TICK)
+    # recolor the QQ scatter/line to match
+    if ax[1].get_lines():
+        ax[1].get_lines()[0].set_color(point_color)
+        ax[1].get_lines()[0].set_markerfacecolor(point_color)
+        if len(ax[1].get_lines()) > 1:
+            ax[1].get_lines()[1].set_color("#d62728")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
