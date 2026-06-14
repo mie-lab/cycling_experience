@@ -1,7 +1,7 @@
 from collections import Counter
 import pandas as pd
 import re
-from scipy.stats import pearsonr, spearmanr, friedmanchisquare
+from scipy.stats import pearsonr, spearmanr, friedmanchisquare, page_trend_test
 import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy import stats
@@ -317,6 +317,3 @@ def friedman_kendall(df, subject_col, condition_col, value_col):
         "chi2": float(chi2), "df": k - 1, "p": float(p),
         "kendall_w": float(kendall_w), "n_subjects": int(n), "n_conditions": int(k),
     }
-
-
-
