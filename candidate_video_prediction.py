@@ -116,19 +116,14 @@ def compute_k_rmse(X, video_df, target_col=c.VALENCE):
     return rmses_df, best_rmse, best_k
 
 
-def predict_candidates(X, video_df, candidate_df, feature_cols, target_col, k, id_col=c.VIDEO_ID_COL, negate=False):
+def predict_candidates(X, video_df, candidate_df, feature_cols, target_col, k,
+                       id_col=c.VIDEO_ID_COL, pred_col='valence_prediction', negate=False):
     """
-    Predict valence for candidate videos using k-NN trained on existing video data.
-    :param X: feature DataFrame for training videos
-    :param video_df: DataFrame with training video data
-    :param candidate_df: DataFrame with candidate video data
-    :param feature_cols: list of feature columns to use
-    :param target_col: name of the target column
-    :param k: number of neighbors
-    :param id_col: name of the ID column
-    :param negate: whether to negate predictions
-    :return: DataFrame with candidate IDs and predicted valence
+    Predict `target_col` for candidate videos using k-NN trained on existing video data.
+    :param pred_col: name of the output prediction column
+                     (defaults to f"{target_col}_prediction")
     """
+    pred_col = pred_col or f"{target_col}_prediction"
     knn = KNeighborsRegressor(n_neighbors=k, weights='distance', metric='manhattan')
     knn.fit(X, video_df.loc[X.index, target_col])
 
@@ -137,12 +132,12 @@ def predict_candidates(X, video_df, candidate_df, feature_cols, target_col, k, i
         pred = knn.predict(candidate_df.loc[vid, feature_cols].to_frame().T)[0]
         if negate:
             pred = -pred
-        rows.append({id_col: candidate_df.loc[vid, id_col], 'valence_prediction': pred})
+        rows.append({id_col: candidate_df.loc[vid, id_col], pred_col: pred})
 
-    results_df = (pd.DataFrame(rows).sort_values(by='valence_prediction', ascending=False).reset_index(drop=True)
-                  )
+    results_df = (pd.DataFrame(rows)
+                  .sort_values(by=pred_col, ascending=False)
+                  .reset_index(drop=True))
     return results_df
-
 
 def get_neighbor_prediction(
         X: pd.DataFrame,
@@ -537,53 +532,100 @@ def main():
     )
 
     # ==============================================================================
-    # PHASE 5: PREDICTIVE MODEL + SYMMETRIC THRESHOLD FILTERING
+    # PHASE 5: PREDICTIVE MODELS (BOTH AXES) + JOINT SYMMETRIC THRESHOLD FILTERING
     # ==============================================================================
-    log.info("Phase 5: Training predictive model and applying symmetric threshold")
+    log.info("Phase 5: Training per-axis predictive models and applying joint threshold")
 
-    # Fit k-NN once; use the LOO-RMSE as the symmetric threshold
     X = data_cluster_df[c.DATA_COLS].copy()
-    rmses_df, best_rmse, best_k = compute_k_rmse(X, data_cluster_df, c.TARGET_COL)
-    log.info(f"LOO RMSE: {best_rmse:.3f} (k={best_k})")
 
-    # Threshold filter on validated set (1 x RMSE from boundary in valence)
-    retained_validated, excluded_validated, boundary = filter_by_distance_to_boundary(
-        data_cluster_df,
-        cluster_col='Cluster_data',
-        valence_col=c.VALENCE,
-        threshold=best_rmse,
-    )
-    log.info(f"Cluster boundary in valence: {boundary:.3f}")
-    log.info(f"Validated clips retained: {len(retained_validated)}/{len(data_cluster_df)}")
+    # Per-axis k-NN: each axis gets its own k, LOO-RMSE band, and centroid boundary.
+    # Bikeable side: high valence, LOW arousal (inverted polarity).
+    axes_spec = {}
+    for target in [c.VALENCE, c.AROUSAL]:
+        _, best_rmse, best_k = compute_k_rmse(X, data_cluster_df, target)
+        centroids = data_cluster_df.groupby('Cluster_data')[target].mean()
+        axes_spec[target] = {
+            'k': best_k,
+            'rmse': best_rmse,
+            'boundary': float(centroids.mean()),
+            'bikeable_side': 'above' if target == c.VALENCE else 'below',
+        }
+        log.info(f"{target}: k={best_k}, LOO RMSE={best_rmse:.3f}, "
+                 f"boundary={axes_spec[target]['boundary']:.3f}")
+
+    def classify_axis(values, spec):
+        """Per-axis label: 'B', 'NB', or 'ambiguous' (within +/- 1 RMSE of boundary)."""
+        hi = values >= spec['boundary'] + spec['rmse']
+        lo = values <= spec['boundary'] - spec['rmse']
+        if spec['bikeable_side'] == 'above':
+            return np.select([hi, lo], ['B', 'NB'], default='ambiguous')
+        return np.select([lo, hi], ['B', 'NB'], default='ambiguous')
+
+    # Joint filter on validated set: both axes unambiguous AND concordant
+    data_cluster_df['class_valence'] = classify_axis(
+        data_cluster_df[c.VALENCE].to_numpy(), axes_spec[c.VALENCE])
+    data_cluster_df['class_arousal'] = classify_axis(
+        data_cluster_df[c.AROUSAL].to_numpy(), axes_spec[c.AROUSAL])
+    data_cluster_df['class_joint'] = np.where(
+        data_cluster_df['class_valence'] == data_cluster_df['class_arousal'],
+        data_cluster_df['class_valence'], 'ambiguous')
+
+    retained_validated = data_cluster_df[data_cluster_df['class_joint'] != 'ambiguous'].copy()
+    excluded_validated = data_cluster_df[data_cluster_df['class_joint'] == 'ambiguous'].copy()
+    log.info(f"Validated clips retained (joint): {len(retained_validated)}/{len(data_cluster_df)}")
+    log.info(f"Joint composition:\n{retained_validated['class_joint'].value_counts()}")
     if len(excluded_validated) > 0:
         log.info(
-            f"Excluded validated clips (near boundary): "
-            f"{excluded_validated[[c.VIDEO_ID_COL, c.VALENCE, 'dist_to_boundary']].to_dict('records')}"
+            f"Excluded validated clips: "
+            f"{excluded_validated[[c.VIDEO_ID_COL, c.VALENCE, c.AROUSAL]].to_dict('records')}"
         )
 
-    # Predict valence for archive candidates
+    # Diagnostic: does the joint criterion change the valence-only selection?
+    val_only_dropped = data_cluster_df[
+        (data_cluster_df['class_valence'] != 'ambiguous')
+        & (data_cluster_df['class_joint'] == 'ambiguous')]
+    if len(val_only_dropped):
+        log.warning(f"Clips passing valence but removed by joint criterion:\n"
+                    f"{val_only_dropped[[c.VIDEO_ID_COL, c.VALENCE, c.AROUSAL]].to_string(index=False)}")
+    else:
+        log.info("Joint criterion retains exactly the valence-criterion set.")
+
+    # Predict both axes for archive candidates
     ids_to_exclude = data_cluster_df[c.VIDEO_ID_COL].unique()
     candidate_video_df = video_ground_truth_features.loc[
         ~video_ground_truth_features[c.VIDEO_ID_COL].isin(ids_to_exclude)
     ]
     predicted_valences = predict_candidates(
         X, data_cluster_df, candidate_video_df,
-        c.DATA_COLS, c.TARGET_COL, best_k,
+        c.DATA_COLS, c.VALENCE, axes_spec[c.VALENCE]['k'],
+        pred_col='valence_prediction',
+    ).merge(
+        predict_candidates(
+            X, data_cluster_df, candidate_video_df,
+            c.DATA_COLS, c.AROUSAL, axes_spec[c.AROUSAL]['k'],
+            pred_col='arousal_prediction',
+        ),
+        on=c.VIDEO_ID_COL, how='left',
     )
 
-    # Same threshold on archive predictions
-    predicted_valences['dist_to_boundary'] = (predicted_valences['valence_prediction'] - boundary).abs()
+    # Joint threshold on archive predictions
+    predicted_valences['class_valence'] = classify_axis(
+        predicted_valences['valence_prediction'].to_numpy(), axes_spec[c.VALENCE])
+    predicted_valences['class_arousal'] = classify_axis(
+        predicted_valences['arousal_prediction'].to_numpy(), axes_spec[c.AROUSAL])
     predicted_valences['classification'] = np.select(
         [
-            (predicted_valences['valence_prediction'] > boundary)
-            & (predicted_valences['dist_to_boundary'] >= best_rmse),
-            (predicted_valences['valence_prediction'] < boundary)
-            & (predicted_valences['dist_to_boundary'] >= best_rmse),
+            (predicted_valences['class_valence'] == 'B')
+            & (predicted_valences['class_arousal'] == 'B'),
+            (predicted_valences['class_valence'] == 'NB')
+            & (predicted_valences['class_arousal'] == 'NB'),
         ],
         ['bikeable_extension', 'non_bikeable_extension'],
         default='ambiguous',
     )
-    log.info(f"Archive classification:\n{predicted_valences['classification'].value_counts()}")
+    log.info(f"Archive classification (joint):\n{predicted_valences['classification'].value_counts()}")
+    log.info(f"Axis agreement on candidates:\n"
+             f"{pd.crosstab(predicted_valences['class_valence'], predicted_valences['class_arousal'])}")
 
     n_extensions = (predicted_valences['classification'] != 'ambiguous').sum()
     log.info(
@@ -614,9 +656,18 @@ def main():
     plot_paired_valence_panels(
         validated_df=data_cluster_df,
         candidates_df=predicted_valences,
-        threshold=best_rmse,
-        boundary=boundary,
+        threshold=axes_spec[c.VALENCE]['rmse'],
+        boundary=axes_spec[c.VALENCE]['boundary'],
         save_path=output_dir / "Valence_filter_panels.png",
+    )
+    plot_paired_valence_panels(
+        validated_df=data_cluster_df,
+        candidates_df=predicted_valences,
+        threshold=axes_spec[c.AROUSAL]['rmse'],
+        boundary=axes_spec[c.AROUSAL]['boundary'],
+        valence_col_validated=c.AROUSAL,
+        valence_col_candidates='arousal_prediction',
+        save_path=output_dir / "Arousal_filter_panels.png",
     )
 
     predicted_valences.to_csv(predicted_valences_file, index=False)
@@ -625,7 +676,6 @@ def main():
     log.info(f"Saved predictions to {predicted_valences_file}")
 
     log.info("Analysis pipeline finished successfully!")
-
 
 if __name__ == "__main__":
     main()
