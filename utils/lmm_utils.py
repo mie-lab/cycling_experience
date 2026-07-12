@@ -11,16 +11,9 @@ log = logging.getLogger(__name__)
 
 def lmm_contrast(fitted, contrast: dict, alpha: float = 0.05) -> dict:
     """
-    Test a linear combination of fixed effects from a fitted statsmodels MixedLM.
-
-    :param fitted: a fitted MixedLMResults object.
-    :param contrast: {coefficient_name: weight}. Names must match fitted.fe_params index
-                     exactly (e.g. "C(pair)[T.NB \u2192 B]"). Coefficients not listed get weight 0.
-    :param alpha: for the (1-alpha) CI.
-    :return: dict with estimate, se, z, p, ci_low, ci_high.
-
-    Example: order effect (B\u2192NB vs NB\u2192B) when reference level is "B \u2192 B":
-        lmm_contrast(model, {"C(pair)[T.B \u2192 NB]": 1, "C(pair)[T.NB \u2192 B]": -1})
+    Wald test of a linear combination of fixed effects from a fitted MixedLM.
+    `contrast` maps coefficient names (must match ``fitted.fe_params``) to weights;
+    unlisted coefficients get 0. Returns estimate, se, z, p, and the (1-alpha) CI.
     """
     names = list(fitted.fe_params.index)
     L = np.zeros(len(names))
@@ -59,14 +52,9 @@ def run_lmm(
 
 ) -> MixedLMResults:
     """
-    Fits a Linear Mixed Model (LMM) with centered categorical predictors for Familiarity (F) and Overall Experience (OE).
-    :param convergence_method:
-    :param groups_col: column for random effects grouping
-    :param vc_formula: variance components formula models by-video variability
-    :param re_formula: specifies slopes for andom effects
-    :param formula: model formula
-    :param df: input DataFrame
-    :return: fitted LMM results
+    Fit a Gaussian LMM by ML (statsmodels). `groups_col` is the random-effects
+    grouping column; `re_formula`/`vc_formula` add random slopes/variance components.
+    Logs the model summary and R² when `verbose`.
     """
     model_df = df.copy()
 
@@ -79,8 +67,9 @@ def run_lmm(
     )
 
     results = model.fit(reml=False, method=convergence_method, maxiter=maxiter)
-    log.info(results.summary())
-    calculate_r2_lmm(results)
+    if verbose:
+        log.info(results.summary())
+        calculate_r2_lmm(results)
 
     return results
 

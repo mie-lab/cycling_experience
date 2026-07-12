@@ -30,11 +30,8 @@ def transform_to_long_df(
         id_col: str = c.PARTICIPANT_ID
 ) -> pd.DataFrame:
     """
-    Convert a DataFrame with sequence data into a long format DataFrame.
-    :param df: DataFrame containing the sequence data.
-    :param seq_df: DataFrame containing sequence information with columns 'seq_start', 'seq_end', and 'Sequence'.
-    :param id_col: str = "ID"
-    :return: DataFrame in long format with columns for ID, demographics, video_id, and question responses.
+    Reshape the wide survey export to one row per (participant, video), keyed by the
+    timestamped sequence each participant saw.
     """
     questions = [c.OE, c.AG, c.PF, c.NF, c.F]
     demo_cols = [c.START, c.END, c.CONSENT, c.GENDER, c.AGE, c.COUNTRY, c.CYCL_FREQ, c.CYCL_PURP, c.CYCL_CONF,
@@ -77,13 +74,8 @@ def filter_results(
         by_country: bool = False
 ) -> pd.DataFrame:
     """
-    Implements filtering logic to clean the survey response data
-    :param df: DataFrame containing the data to filter.
-    :param consent: bool = True, filter out participants without consent.
-    :param duration: bool = True, filter out participants with duration less than 15 minutes.
-    :param location: bool = True, filter out participants with missing location data.
-    :param by_country: bool = False, if True, apply location filter by country.
-    :return: Filtered DataFrame.
+    Clean survey responses: drop non-consenting, <15 min, or missing-location rows
+    (each toggle-able); `by_country` additionally keeps only Switzerland.
     """
     df = df.copy()
     if c.AG in df.columns:
@@ -121,17 +113,9 @@ def aggregate_by_characteristics(
         is_swiss: bool = False
 ):
     """
-    Implements aggregation logic to group categories for demographic and cycling-related characteristics.
-    :param is_swiss: if True, create a new binary column 'is_swiss' based on the 'Country' column.
-    :param df: DataFrame containing the data to filter.
-    :param gender: if True, remove 'Prefer not to say' category.
-    :param age: if True, upward aggregate age groups from '46 - 55 years', '56 - 65 years', '+65 years' to '46+ years'.
-    :param cycling_environment: if True, remove 'Other' category.
-    :param cycling_frequency: if True, aggregate cycling frequency categories into 'Frequent' and 'Infrequent'.
-    :param cycling_confidence: if True, aggregate cycling confidence into 'Confident' and 'Not confident'.
-    :param cycling_purpose: if True, aggregate cycling purpose categories into 'Commuting' and 'Recreational', 'I do not cycle'.
-    :param familiarity: if True, aggregate familiarity categories into 'Unfamiliar', 'Neutral', and 'Familiar'.
-    :return: aggregated DataFrame.
+    Collapse demographic/cycling categories into coarser groups (one boolean toggle per
+    field); `is_swiss` adds a binary residence column. Exact groupings are in the lookup
+    tables below.
     """
     df = df.copy()
     mask = pd.Series(True, index=df.index)
@@ -274,13 +258,7 @@ def add_valence_arousal(
         ag_col: str = c.AG,
         grid: int = 10
 ) -> pd.DataFrame:
-    """
-    Add valence and arousal columns to a DataFrame based on the Arousal and Valence grid ratings.
-    :param df: DataFrame to modify.
-    :param ag_col: Column name containing the Arousal and Valence grid values.
-    :param grid: Size of the grid (default is 10).
-    :return: DataFrame with added 'valence' and 'arousal' columns.
-    """
+    """Map Affect-Grid cell numbers in `ag_col` to continuous valence/arousal in [-1, 1]."""
     df = df.copy()
     ag = pd.to_numeric(df[ag_col], errors="coerce")
     idx0 = ag - 1
@@ -1454,11 +1432,7 @@ def prepare_categorical_predictors(df: pd.DataFrame, ordinal_map: dict) -> pd.Da
 
 
 def _offtype_clip_id(row, pos_col="spoiler_position"):
-    """
-    Video id of the off-type (spoiler) segment, or 'baseline' for homogeneous routes.
-    spoiler_position is 1-indexed (1..3); 0 means no spoiler (baseline).
-    Reads from pos1_video_id / pos2_video_id / pos3_video_id.
-    """
+    """Off-type (spoiler) clip id, or 'baseline' for homogeneous routes (spoiler_position 0)."""
     try:
         pos = int(row[pos_col])
     except (TypeError, ValueError):
@@ -1476,10 +1450,8 @@ def prepare_combined_scenario_df(
         df_negative: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Prepare a combined DataFrame for both positive and negative scenarios.
-    :param df_positive: DataFrame for the positive scenario.
-    :param df_negative: DataFrame for the negative scenario.
-    :return: Combined DataFrame with standardized columns and additional useful columns.
+    Stack the positive and negative blocks into one modelling frame, adding `scenario`,
+    `spoiler_position`, `NB_count`, and `spoiler_clip`.
     """
     # Create copies to avoid modifying original dataframes
     df_pos = df_positive.copy()

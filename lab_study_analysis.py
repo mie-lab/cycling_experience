@@ -125,9 +125,7 @@ def main():
 
     lab_video_scores = utils.processing_utils.calculate_video_level_scores(df1, lab_bool=True)
 
-    # Lab-sample valence–arousal coupling: clip-level Pearson (matches the manuscript's
-    # linear inverse coupling; computed before the merge while columns are plain).
-
+    # Lab-sample valence–arousal coupling (clip-level Pearson)
     va_r = lab_video_scores[['valence', 'arousal']].corr(method='pearson').iloc[0, 1]
     log.info(f"Lab-sample valence–arousal coupling (clip-level Pearson): r = {va_r:.3f}")
 
@@ -455,9 +453,17 @@ def main():
         pd.DataFrame(sens_rows).to_csv(
             output_dir / f"spoiler_covariate_sensitivity_{OUTCOME}.csv", index=False)
 
+        # Orient the RQ2 magnitude contrast so a positive estimate always means a
+        # negativity bias (|NB shift| > |B shift|): negate it for arousal.
+        neg_dir = 1.0 if OUTCOME == "valence" else -1.0
+        outcome_specs = dict(contrast_specs)
+        outcome_specs["rq2_magnitude"] = {
+            k: neg_dir * v for k, v in contrast_specs["rq2_magnitude"].items()
+        }
+
         # Planned + descriptive contrasts (Holm within planned family), all on m_inter
         planned_pvals, planned_idx = [], []
-        for name, spec in contrast_specs.items():
+        for name, spec in outcome_specs.items():
             ct = utils.lmm_utils.lmm_contrast(m_inter, spec)
             is_planned = name in PLANNED_FAMILIES
             all_contrasts.append({
@@ -514,12 +520,12 @@ def main():
             df=df_combined, formula=f"{OUTCOME} ~ mean_{OUTCOME}",
             groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
 
-        # This is our optimized Sequential (Recency) model used for the model competition
+        # Sequential (recency-weighted) model for the competition
         m_seq = utils.lmm_utils.run_lmm(
             df=df_combined, formula=f"{OUTCOME} ~ mean_{OUTCOME} + recency_{OUTCOME}",
             groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
 
-        # This is the unconstrained model, used strictly to calculate the Wald contrasts (b3 - b1)
+        # Unconstrained model — only for the Wald contrasts (b3 - b1, etc.)
         m_seq_unconstrained = utils.lmm_utils.run_lmm(
             df=df_combined, formula=f"{OUTCOME} ~ pos1_{OUTCOME} + pos2_{OUTCOME} + pos3_{OUTCOME}",
             groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
@@ -532,17 +538,23 @@ def main():
             df=df_combined, formula=f"{OUTCOME} ~ {neg} + {end}",
             groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
 
+        # Nakagawa & Schielzeth marginal/conditional R² for the model-comparison table.
+        r2_add = utils.lmm_utils.calculate_r2_lmm(m_additive)
+        r2_seq = utils.lmm_utils.calculate_r2_lmm(m_seq)
+        r2_pe = utils.lmm_utils.calculate_r2_lmm(m_peak_end)
+        r2_me = utils.lmm_utils.calculate_r2_lmm(m_min_end)
+
         pd.DataFrame({
             "Outcome": OUTCOME,
             "Model": ["Additive (mean-value)", "Sequential (recency-weighted)",
                       "Peak-End (Sym)", "Minimum-End"],
             "AIC": [m_additive.aic, m_seq.aic, m_peak_end.aic, m_min_end.aic],
             "BIC": [m_additive.bic, m_seq.bic, m_peak_end.bic, m_min_end.bic],
+            "R2m": [r2_add[0], r2_seq[0], r2_pe[0], r2_me[0]],
+            "R2c": [r2_add[1], r2_seq[1], r2_pe[1], r2_me[1]],
         }).sort_values("AIC").to_csv(output_dir / f'stage4_model_comparison_{OUTCOME}.csv', index=False)
 
-        # Recency Tests:
-        # 1. We test Additive vs Recency-weighted using direct LR test
-        # 2. We use the unconstrained model to get the exact differences between pos3, pos2, and pos1
+        # Recency: LR test (additive vs recency) + Wald contrasts between positions.
         recency_out = pd.DataFrame([
             utils.helper_functions.lr_test(m_additive, m_seq, label="equal-weights vs recency-weighted"),
             utils.helper_functions.wald_contrast(m_seq_unconstrained, {f"pos3_{OUTCOME}": 1, f"pos1_{OUTCOME}": -1},
@@ -579,7 +591,22 @@ def main():
                 except Exception as e:
                     log.warning(f"CV fold (p={held_out}, {name}) failed: {e}")
 
-        fold_df = pd.DataFrame(cv_fold_rmse).dropna()
+        # Keep only participants whose fold converged for ALL models, so the paired
+        # comparison is balanced. Report how many were dropped (and why) for audit.
+        raw_fold_df = pd.DataFrame(cv_fold_rmse)
+        fold_df = raw_fold_df.dropna()
+        n_total, n_kept = len(raw_fold_df), len(fold_df)
+        if n_total != n_kept:
+            dropped_ids = raw_fold_df.index[raw_fold_df.isna().any(axis=1)].tolist()
+            per_model_failures = raw_fold_df.isna().sum().to_dict()
+            log.warning(
+                f"Stage 4b CV [{OUTCOME}]: {n_kept}/{n_total} participants retained; "
+                f"dropped {n_total - n_kept} with a non-converged fold "
+                f"(ids={dropped_ids}); per-model failures: {per_model_failures}")
+        else:
+            log.info(f"Stage 4b CV [{OUTCOME}]: all {n_total} participant folds converged "
+                     f"(0 dropped).")
+
         summary = fold_df.mean().sort_values().rename("mean_fold_RMSE").to_frame()
         best = summary.index[0]
         rows = []
@@ -628,13 +655,9 @@ def main():
     pd.DataFrame(all_contrasts).to_csv(output_dir / "all_planned_contrasts.csv", index=False)
 
     # ==========================================================================
-    # PHYSIOLOGY (exploratory) — measurement check, reported as a limitation:
-    #   (1) Does physio track the affect ratings?  -> correlations (clip + sequence)
-    #   (2) Does physio carry the sequence effect?  -> position LMMs
-    # Filtered set (PHYSIO_EXCLUDE). Correlations use within-participant standardized
-    # metrics (rescaling for Spearman); LMMs use raw scale so the by-participant
-    # random intercept absorbs between-person differences (standardizing there would
-    # collapse the random effect to the boundary).
+    # PHYSIOLOGY (exploratory): (1) does physio track affect? -> correlations;
+    # (2) does physio carry the sequence effect? -> position LMMs. Filtered set
+    # (PHYSIO_EXCLUDE); correlations within-participant standardized, LMMs raw scale.
     # ==========================================================================
     log.info("\n--- Physiology (exploratory) ---")
 

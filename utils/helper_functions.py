@@ -12,12 +12,8 @@ from scipy.stats import wilcoxon
 
 def get_trial_dict(study_results, experiment_setup, trial_label, trial_video_counts):
     """
-    Extracts ratings and rankings for a specific trial from study results and experiment setup.
-    :param study_results: DataFrame with study results
-    :param experiment_setup: DataFrame with experiment setup
-    :param trial_label: label of the trial to extract (e.g., 'DJI', '2', '3', '4')
-    :param trial_video_counts: dict with number of videos per trial
-    :return: Dictionary with participant IDs as keys and their ratings/rankings as values
+    Extract ratings (and rankings) for one trial from the study results.
+    `trial_label` is e.g. 'DJI', '2', '3', '4'. Returns {participant_id: {ratings, ranks}}.
     """
     trial_dict = {}
     n_total = trial_video_counts[trial_label]
@@ -52,11 +48,7 @@ def get_trial_dict(study_results, experiment_setup, trial_label, trial_video_cou
 
 
 def trial_dict_to_df(trial_dict):
-    """
-    Converts a trial dictionary to a DataFrame.
-    :param trial_dict: Dictionary with participant IDs as keys and their ratings/rankings as values
-    :return: DataFrame with columns: participant_id, video_id, rating, ranking (if available)
-    """
+    """Flatten a trial dict into rows of participant_id, video_id, rating[, ranking]."""
     records = []
     for pid, data in trial_dict.items():
         rank_map = {fname: r for fname, r in data.get('ranks', [])}
@@ -112,16 +104,7 @@ def get_video_level_metrics(df, lab_sample, prediction, online_sample):
 
     return out
 def check_variance_homogeneity(df, group_col, target_col, center='median', alpha=0.05, print_msg=True):
-    """
-    Levene's test for equal variances across groups.
-    :param df: input DataFrame
-    :param group_col: column to group by
-    :param target_col: column to test variances on
-    :param center: 'mean' or 'median' for Levene's test
-    :param alpha: significance level
-    :param print_msg: whether to print the result message
-    :return: LeveneResult object
-    """
+    """Levene's test for equal variances of `target_col` across `group_col`."""
     groups = [g[target_col].dropna().values for _, g in df.groupby(group_col)]
     res = stats.levene(*groups, center=center)
     if print_msg:
@@ -142,15 +125,8 @@ def add_sequence_info(
         arousal_col=c.AROUSAL
 ):
     """
-    Adds sequence information to the main DataFrame.
-    :param nb: whether to look for 'NB' or 'B' in sequences, default scenario is NB (non-bikeable)
-    :param df: main DataFrame
-    :param video_mapping: mapping of video IDs to sequences
-    :param video_sequences: DataFrame with video sequences
-    :param video_level_scores: DataFrame with video-level scores
-    :param valence_col: name of the valence column
-    :param arousal_col: name of the arousal column
-    :return: DataFrame with added sequence information
+    Expand each sequence into per-position clip ids and valence/arousal columns, plus
+    B/NB counts, the off-type `scenario` position, and mean/peak/end aggregates.
     """
     df['sequence_list'] = df[c.VIDEO_ID_COL].map(video_mapping)
     cond_df = pd.DataFrame(df['sequence_list'].tolist(), index=df.index)
@@ -224,16 +200,7 @@ def load_and_process_trial_data(
         video_level_scores: pd.DataFrame,
         scenario='NB'
 ) -> pd.DataFrame:
-    """
-    Load and process trial data into a DataFrame and enrich with sequence info.
-    :param scenario: 'NB' or 'B' indicating the scenario type
-    :param study_results: DataFrame with study results
-    :param experiment_setup: DataFrame with experiment setup
-    :param video_sequences: DataFrame with video sequences
-    :param trial_params: dict with trial parameters
-    :param video_level_scores: DataFrame with video-level scores
-    :return: Processed DataFrame
-    """
+    """Load one trial's ratings/rankings and enrich with sequence info (`scenario` = 'NB'|'B')."""
     trial_dict = get_trial_dict(study_results, experiment_setup, trial_params['trial_label'], c.VIDEO_COUNTS)
     df = trial_dict_to_df(trial_dict)
 
@@ -297,11 +264,8 @@ def lr_test(fit_small, fit_big, label=""):
 
 def friedman_kendall(df, subject_col, condition_col, value_col):
     """
-    Friedman test + Kendall's W on repeated rankings.
-    Reshapes long -> wide (subjects x conditions), drops subjects with any
-    missing condition, runs Friedman, converts chi2 to Kendall's W.
-
-    :return: dict with chi2, df, p, kendall_w, n_subjects, n_conditions.
+    Friedman test + Kendall's W on repeated rankings (complete cases only).
+    Returns chi2, df, p, kendall_w, n_subjects, n_conditions.
     """
     wide = df.pivot_table(index=subject_col, columns=condition_col, values=value_col)
     wide = wide.dropna(axis=0)  # complete cases only — Friedman needs balanced data
@@ -316,4 +280,47 @@ def friedman_kendall(df, subject_col, condition_col, value_col):
     return {
         "chi2": float(chi2), "df": k - 1, "p": float(p),
         "kendall_w": float(kendall_w), "n_subjects": int(n), "n_conditions": int(k),
+    }
+
+
+def page_trend_ranking(df, subject_col, condition_col, value_col, predicted_order):
+    """
+    Page's trend test for an ordered alternative on repeated rankings: is `value_col`
+    monotonically increasing across `condition_col` in `predicted_order`? Columns are
+    ordered to `predicted_order` (predicted ranks 1..k), complete cases only, and
+    scipy's Page L test runs on the within-subject ranks (`ranked=False`, tie-averaged).
+    Returns L, p, method, n_subjects, n_dropped, n_conditions, predicted_order,
+    mean_rank_by_condition.
+    """
+    predicted_order = list(predicted_order)
+
+    wide = df.pivot_table(index=subject_col, columns=condition_col, values=value_col)
+
+    missing = [cond for cond in predicted_order if cond not in wide.columns]
+    if missing:
+        raise ValueError(f"Conditions {missing} not found in '{condition_col}'.")
+
+    wide = wide[predicted_order]        # order columns by the predicted trend
+    n_before = len(wide)
+    wide = wide.dropna(axis=0)          # complete cases only
+    n_after = len(wide)
+
+    n, k = wide.shape
+    if n < 2 or k < 3:
+        raise ValueError(f"Need >=2 subjects and >=3 conditions; got {n} x {k}.")
+
+    res = page_trend_test(wide.to_numpy(), ranked=False, method="auto")
+
+    mean_rank = df.groupby(condition_col)[value_col].mean()
+    mean_rank_by_condition = {cond: float(mean_rank[cond]) for cond in predicted_order}
+
+    return {
+        "L": float(res.statistic),
+        "p": float(res.pvalue),
+        "method": res.method,
+        "n_subjects": int(n_after),
+        "n_dropped": int(n_before - n_after),
+        "n_conditions": int(k),
+        "predicted_order": predicted_order,
+        "mean_rank_by_condition": mean_rank_by_condition,
     }
