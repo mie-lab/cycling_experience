@@ -690,8 +690,18 @@ def main():
                 corr_rows.append({"level": level, "metric": metric, "affect": affect,
                                   "n": len(sub), "rho": round(rho, 3), "p_raw": round(p, 4)})
     corr_df = pd.DataFrame(corr_rows)
-    corr_df["p_holm"] = multipletests(corr_df["p_raw"], method="holm")[1]
-    log.info(f"\nPhysio–affect tracking:\n{corr_df.to_string(index=False)}")
+    corr_df["family"] = np.where(corr_df["level"] == "clips",
+                                 "clip_tracking", "sequence_tracking")
+    corr_df["p_holm"] = np.nan
+    for fam, idx in corr_df.groupby("family").groups.items():
+        corr_df.loc[idx, "p_holm"] = multipletests(
+            corr_df.loc[idx, "p_raw"], method="holm")[1]
+
+    # Report the two families separately in the log for auditability
+    for fam in ["clip_tracking", "sequence_tracking"]:
+        sub = corr_df[corr_df["family"] == fam]
+        log.info(f"\nPhysio–affect tracking [{fam}, {len(sub)} tests]:\n"
+                 f"{sub.to_string(index=False)}")
     corr_df.to_csv(output_dir / "physio_affect_tracking.csv", index=False)
 
     # --- (2) Does physio carry the sequence effect? (raw scale; log1p SCR only) ---
