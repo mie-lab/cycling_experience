@@ -107,7 +107,7 @@ cycling_experience/
     ```bash
     python lab_study_analysis.py
     ```
-    * **Description**: Performs block-level analysis (Validation, Equal, Positive, and Negative scenarios) and tests positional effects of "spoilers" using Linear Mixed Models (LMMs).
+    * **Description**: Performs block-level analysis (Validation, Equal, Positive, and Negative scenarios) and tests positional effects of off-type segments using Linear Mixed Models (LMMs).
     * **Output**: Scenario-specific visualizations and statistical model comparisons.
 
 5.  **Extract Features Using LLMs**:
