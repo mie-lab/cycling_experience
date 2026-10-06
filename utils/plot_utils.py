@@ -2404,7 +2404,7 @@ def plot_individual_slopes(
         data: pd.DataFrame,
         grouping_var: str,
         output_path: str,
-        x_col: str = 'spoiler_position_num',
+        x_col: str = 'off_type_position_num',
         y_col: str = 'valence',
         scenario_col: str = 'scenario',
         participant_col: str = 'participant_id',
@@ -2453,7 +2453,7 @@ def plot_individual_slopes(
     # --- 4. Customize and add a single legend ---
     for i, scenario in enumerate(scenarios):
         axes[i].set_title(f'Scenario: {scenario}')
-        axes[i].set_xlabel('Spoiler Position')
+        axes[i].set_xlabel('Off-type Position')
         axes[i].grid(True)
     axes[0].set_ylabel('Valence Rating')
 
@@ -2514,56 +2514,6 @@ def plot_segmentation_overlay(
     else:
         plt.show()
 
-
-def plot_bland_altman(
-    df: pd.DataFrame,
-    measurement1: str,
-    measurement2: str,
-    label_col: str,
-    save_path: Optional[Path] = None
-) -> dict:
-    """
-    Bland-Altman plot comparing two measurements. Returns the agreement
-    statistics (bias and 95% limits of agreement) so they can be tabled.
-    """
-    df_agree = df.dropna(subset=[measurement1, measurement2]).copy()
-    avg_col = 'average_score'
-    diff_col = 'difference_score'
-    df_agree[avg_col] = (df_agree[measurement1] + df_agree[measurement2]) / 2
-    df_agree[diff_col] = df_agree[measurement1] - df_agree[measurement2]
-
-    mean_diff = df_agree[diff_col].mean()
-    std_diff = df_agree[diff_col].std()
-    upper_loa = mean_diff + 1.96 * std_diff
-    lower_loa = mean_diff - 1.96 * std_diff
-
-    plt.figure(figsize=(5, 5))
-    plt.scatter(df_agree[avg_col], df_agree[diff_col], alpha=0.7)
-
-    for index, row in df_agree.iterrows():
-        plt.text(row[avg_col], row[diff_col], str(row[label_col]),
-                 fontsize=8, ha='center', va='bottom')
-
-    plt.axhline(mean_diff, color='red', linestyle='--', label='Mean Difference (Bias)')
-    plt.axhline(upper_loa, color='gray', linestyle='--', label='Upper Limit of Agreement')
-    plt.axhline(lower_loa, color='gray', linestyle='--', label='Lower Limit of Agreement')
-    title1 = measurement1.replace('_', ' ').title()
-    title2 = measurement2.replace('_', ' ').title()
-    plt.title(f'Bland-Altman Plot: {title1} vs. {title2}')
-    plt.xlabel('Average of Scores')
-    plt.ylabel(f'Difference in Scores ({measurement1} - {measurement2})')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Bland-Altman plot saved to {save_path}")
-    else:
-        plt.show()
-
-    return {'n': len(df_agree), 'bias': mean_diff,
-            'lower_loa': lower_loa, 'upper_loa': upper_loa, 'sd_diff': std_diff}
 
 def plot_typology_parallel_coords(df, feature_cols, id_col, categorical_maps=None, save_path=None):
     """
@@ -2861,8 +2811,8 @@ def plot_bland_altman(
     save_path: Optional[Path] = None
 ) -> dict:
     """
-    Bland-Altman plot comparing two measurements. Returns the agreement
-    statistics (bias and 95% limits of agreement) so they can be tabled.
+    Bland-Altman plot comparing two measurements. Returns the 95% limits of
+    agreement, SD of differences and proportional bias (slope on measurement2).
     """
     df_agree = df.dropna(subset=[measurement1, measurement2]).copy()
     avg_col = 'average_score'
@@ -2901,54 +2851,17 @@ def plot_bland_altman(
     if save_path:
         fig.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close(fig)
-        print(f"Bland-Altman plot saved to {save_path}")
     else:
         plt.show()
 
-    return {'n': len(df_agree), 'bias': mean_diff,
-            'lower_loa': lower_loa, 'upper_loa': upper_loa, 'sd_diff': std_diff}
+    # 95% CI of the bias (mean difference)
+    bias_half_ci = stats.t.ppf(0.975, len(df_agree) - 1) * std_diff / np.sqrt(len(df_agree))
 
-
-def plot_clip_affect_space(
-    df: pd.DataFrame,
-    valence_col: str = "valence",
-    arousal_col: str = "arousal",
-    id_col: str = c.VIDEO_ID_COL,
-    save_path: Optional[Path] = None,
-) -> None:
-    """
-    Scatter of clip-level mean valence/arousal (centroids) on the Affect Grid (Stage 1).
-    """
-    d = df.dropna(subset=[valence_col, arousal_col]).copy()
-    point_color = plt.get_cmap("YlGnBu")(0.65)
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-
-    for gv in np.arange(-1, 1 + 1e-9, 0.2):
-        ax.axhline(gv, color="lightgrey", lw=0.8, zorder=0)
-        ax.axvline(gv, color="lightgrey", lw=0.8, zorder=0)
-    ax.axhline(0, color="darkgrey", lw=1.2, zorder=1)
-    ax.axvline(0, color="darkgrey", lw=1.2, zorder=1)
-
-    ax.scatter(d[valence_col], d[arousal_col], s=110,
-               color=point_color, edgecolor="white", linewidth=0.9, zorder=3)
-    for _, r in d.iterrows():
-        ax.text(r[valence_col], r[arousal_col], str(int(r[id_col])),
-                fontsize=_FS_ANNOT, ha="center", va="center", zorder=4, color="#222")
-
-    ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("Valence [-1, 1]", fontsize=_FS_LABEL)
-    ax.set_ylabel("Arousal [-1, 1]", fontsize=_FS_LABEL)
-    ax.set_xticks([]); ax.set_yticks([])
-    ax.set_title("Clip-level affect (lab centroids)", fontsize=_FS_TITLE, fontweight="bold")
-
-    fig.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-    else:
-        plt.show()
+    # Proportional bias, regressed on the reference: the noisier measurement1 would inflate a slope on the average
+    prop = stats.linregress(df_agree[measurement2], df_agree[diff_col])
+    return {'bias_ci_low': mean_diff - bias_half_ci, 'bias_ci_high': mean_diff + bias_half_ci,
+            'lower_loa': lower_loa, 'upper_loa': upper_loa, 'sd_diff': std_diff,
+            'prop_slope': prop.slope, 'prop_p': prop.pvalue}
 
 
 def plot_sequence_trend_panels(
@@ -3033,7 +2946,7 @@ def plot_sequence_trend_panels(
         ax.set_xlabel("Sequence order", fontsize=_FS_LABEL)
         ax.set_ylim(*ylim)
         ax.set_xticks(x)
-        ax.set_xticklabels(order, ha="right", fontsize=_FS_TICK)
+        ax.set_xticklabels(order, ha="center", fontsize=_FS_TICK)
         ax.tick_params(axis="y", labelsize=_FS_TICK)
         ax.grid(True, axis="y", alpha=0.25)
 
@@ -3159,14 +3072,14 @@ def plot_ranking_distribution_combined(
 
 def plot_emm_interaction(emm_df, outcome_name, output_dir, log_obj):
     """
-    Estimated Marginal Means: interaction of sequence type and spoiler position.
-    Positive/Negative blocks use the two fixed categorical anchors (YlGnBu ends)
+    Estimated Marginal Means: interaction of sequence type and off-type position.
+    The two blocks use the two fixed categorical anchors (YlGnBu ends)
     rather than green/red, matching the rest of the figures.
     """
     fig, ax = plt.subplots(figsize=(8, 5))
 
     colors = {"Positive": _CAT_A, "Negative": _CAT_B}
-    labels = {"Positive": "Positive block (NB spoiler)", "Negative": "Negative block (B spoiler)"}
+    labels = {"Positive": "Bikeable block (NB off-type)", "Negative": "Non-bikeable block (B off-type)"}
 
     for block in ["Positive", "Negative"]:
         subset = emm_df[emm_df["block"] == block]
@@ -3179,14 +3092,14 @@ def plot_emm_interaction(emm_df, outcome_name, output_dir, log_obj):
         )
 
     ax.set_xticks([0, 1, 2, 3])
-    ax.set_xticklabels(["Homogeneous\nBaseline", "Spoiler\nPos 1", "Spoiler\nPos 2", "Spoiler\nPos 3"],
+    ax.set_xticklabels(["Homogeneous\nBaseline", "Off-type\nPos 1", "Off-type\nPos 2", "Off-type\nPos 3"],
                        fontsize=_FS_TICK)
     ax.set_ylim(-1.05, 1.05)
     ax.axhline(0, color='gray', linestyle='--', linewidth=1, zorder=0)
     ax.set_ylabel(f"Estimated marginal mean ({outcome_name.capitalize()})",
                   fontsize=_FS_LABEL, fontweight='bold')
     ax.tick_params(axis="y", labelsize=_FS_TICK)
-    ax.set_title(f"Sequence type \u00d7 spoiler position on {outcome_name.capitalize()}",
+    ax.set_title(f"Sequence type \u00d7 off-type position on {outcome_name.capitalize()}",
                  fontsize=_FS_TITLE)
     ax.legend(loc="best", frameon=True, fontsize=_FS_TICK)
 
