@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from statsmodels.regression.mixed_linear_model import MixedLMResults
+from statsmodels.stats.multitest import multipletests
 import statsmodels.formula.api as smf
 
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +39,27 @@ def lmm_contrast(fitted, contrast: dict, alpha: float = 0.05) -> dict:
         "estimate": est, "se": se, "z": z, "p": p,
         "ci_low": est - crit * se, "ci_high": est + crit * se,
     }
+
+
+def contrast_table(fitted, weights, holm=False):
+    """Wald contrasts for {name: weights}, optionally with Holm-adjusted p-values."""
+    table = pd.DataFrame({name: lmm_contrast(fitted, w.to_dict()) for name, w in weights.items()}).T
+    if holm:
+        table['p_holm'] = multipletests(table['p'], method='holm')[1]
+    return table
+
+
+def cell_weights(fixed_effects, scenario, position):
+    """M2 weights for the predicted mean of one scenario x off-type position cell."""
+    w = pd.Series(0.0, index=fixed_effects)
+    w['Intercept'] = 1
+    if scenario == 'Positive':
+        w['C(scenario)[T.Positive]'] = 1
+    if position:
+        w[f'C(off_type_position)[T.{position}]'] = 1
+        if scenario == 'Positive':
+            w[f'C(off_type_position)[T.{position}]:C(scenario)[T.Positive]'] = 1
+    return w
 
 
 def run_lmm(
