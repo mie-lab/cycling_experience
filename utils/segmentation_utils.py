@@ -10,7 +10,7 @@ from moviepy.editor import VideoFileClip
 from PIL import Image
 
 import constants
-from utils.plotting_utils import plot_segmentation_overlay
+from utils.plot_utils import plot_segmentation_overlay
 
 #--- Basic Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

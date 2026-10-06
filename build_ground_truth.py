@@ -4,7 +4,7 @@ import configparser
 from pathlib import Path
 import logging
 import constants as c
-import utils.processing_utils
+import utils.process_utils
 from utils.segmentation_utils import extract_frames_from_videos, run_semantic_segmentation
 
 logging.basicConfig(level=logging.INFO)
@@ -34,8 +34,8 @@ def main():
     log.info("Phase 1: Aggregating and enriching geospatial data for all videos.")
     gpx_paths = [video_geom_dir / f for f in video_geom_dir.iterdir() if f.suffix.lower() in ['.gpkg', '.gpx']]
 
-    video_geom = utils.processing_utils.aggregate_video_level_geometry(gpx_paths)
-    video_geom = utils.processing_utils.enrich_with_spatial_data(video_geom, config)
+    video_geom = utils.process_utils.aggregate_video_level_geometry(gpx_paths)
+    video_geom = utils.process_utils.enrich_with_spatial_data(video_geom, config)
 
     # ==============================================================================
     # 2. GENERATE SEMANTIC FEATURES
