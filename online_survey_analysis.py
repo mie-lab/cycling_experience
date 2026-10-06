@@ -1,12 +1,17 @@
 import constants as c
-import utils.helper_functions
-import utils.plotting_utils
-import utils.processing_utils
+import utils.helper_utils
+import utils.plot_utils
+import utils.process_utils
 import utils.lmm_utils
 import configparser
 import logging
 from pathlib import Path
 import pandas as pd
+import os
+
+# Set to a specific number of cores or the count of logical cores
+os.environ["LOKY_MAX_CPU_COUNT"] = str(os.cpu_count() or 4)
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -38,9 +43,9 @@ def main():
     seq_df = pd.read_csv(sequence_file, parse_dates=['seq_start', 'seq_end'])
 
     # Clean and preprocess the survey response data
-    survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
-    survey_results_df = utils.processing_utils.filter_results(survey_results_df)
-    survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
+    survey_results_df = utils.process_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
+    survey_results_df = utils.process_utils.filter_results(survey_results_df)
+    survey_results_df = utils.process_utils.add_valence_arousal(survey_results_df)
 
     # =============================================================================
     # PHASE 2: DEMOGRAPHIC SUMMARY AND AGGREGATION
@@ -48,7 +53,7 @@ def main():
     log.info("Generating demographic summaries and aggregating categories...")
 
     # Aggregate demographic categories to ensure sufficient sample size in each group
-    survey_results_df = utils.processing_utils.aggregate_by_characteristics(
+    survey_results_df = utils.process_utils.agg_by_chars(
         survey_results_df,
         age=True,
         gender=True,
@@ -61,13 +66,13 @@ def main():
     )
 
     # Generate demographic summary table with aggregated categories
-    utils.plotting_utils.generate_demographic_table(
+    utils.plot_utils.generate_demographic_table(
        survey_results_df,
        demo_cols=c.DEMOGRAPHIC_COLUMNS,
        output_path=Path(output_dir / 'demographic_summary_aggregated.csv')
     )
 
-    reliability_df = utils.processing_utils.compute_video_reliability(survey_results_df)
+    reliability_df = utils.process_utils.compute_video_reliability(survey_results_df)
     log.info(f"\n--- Video Reliability (ICC) ---\n{reliability_df}\n")
 
     # =============================================================================
@@ -76,7 +81,7 @@ def main():
     log.info("Generating exploratory visualizations for RQ1...")
 
     # Plot affect grid for all videos combined
-    utils.plotting_utils.plot_affect_grid_subplots(
+    utils.plot_utils.plot_affect_grid_subplots(
        survey_results_df,
        ncols=5, nrows=6,
        normalize="count",
@@ -85,20 +90,20 @@ def main():
     )
 
     # Plot separate heatmaps for each video
-    utils.plotting_utils.plot_affect_grid(
+    utils.plot_utils.plot_affect_grid(
        survey_results_df,
        video_id=None,
        save_path=output_dir / "affect_grid_heatmaps")
 
     # Plot affect grid usage with marginals (overall)
-    utils.plotting_utils.plot_affect_grid_usage_with_marginals(
+    utils.plot_utils.plot_affect_grid_usage_with_marginals(
        survey_results_df,
        normalize="count",
        save_path=output_dir / "affect_grid_usage.png",
     )
 
     # Plot affective quadrant distribution for each video
-    utils.plotting_utils.create_quadrant_distribution_plot(
+    utils.plot_utils.create_quadrant_distribution_plot(
        survey_results_df,
        video_id_column=c.VIDEO_ID_COL,
        output_path=output_dir / "affective_quadrant_distribution_per_video.png"
@@ -110,20 +115,20 @@ def main():
     log.info("Calculating video-level affect metrics and analyzing PF/NF disagreement for RQ2...")
 
     # Calculate video-level affect metrics and save to CSV
-    video_level_scores = utils.processing_utils.calculate_video_level_scores(
+    video_level_scores = utils.process_utils.calc_video_level_scores(
         survey_results_df,
         output_path=Path(output_dir / "video_level_affect_metrics.csv")
     )
 
     # Plot video-level affect means with vectors for OE groups
-    utils.plotting_utils.plot_video_affect_means_with_vectors(
+    utils.plot_utils.plot_video_affect_means_with_vectors(
        video_level_scores,
        save_path=output_dir / "video_affect_vectors_oe.png",
        oe_col="oe_mode",
     )
 
     # Add PF/NF label counts to video-level scores and save to CSV
-    video_level_scores = utils.processing_utils.add_factor_counts_to_scores(
+    video_level_scores = utils.process_utils.add_factor_counts_to_scores(
         video_level_scores,
         survey_results_df,
         c.LABEL_COLS,
@@ -132,7 +137,7 @@ def main():
         nf_col=c.NF
     )
 
-    video_level_scores, _ = utils.processing_utils.pf_nf_disagreement_analysis(
+    video_level_scores, _ = utils.process_utils.pf_nf_disagreement_analysis(
         video_level_scores,
         label_cols=c.LABEL_COLS,
         out_csv_path=output_dir / "video_level_affect_metrics_pf_nf.csv"
@@ -144,13 +149,13 @@ def main():
     log.info("Phase 4.5: Calculating marginal affective pull of environmental drivers...")
 
     # 1. Identify drivers through local displacement calculation
-    affective_drivers = utils.processing_utils.get_marginal_affective_drivers(
+    affective_drivers = utils.process_utils.get_marginal_affective_drivers(
         survey_results_df,
         c.LABEL_COLS
     )
 
     # 2. Plot the affective force field
-    utils.plotting_utils.plot_conditional_displacement_vectors(
+    utils.plot_utils.plot_conditional_displacement_vectors(
         affective_drivers,
         output_dir / "environmental_affective_drivers_force_field.png",
         limit=0.35
@@ -163,7 +168,7 @@ def main():
 
     # Calculate video-level scores by demographic subgroups and save to separate CSVs
     for col in c.DEMOGRAPHIC_COLUMNS:
-        utils.processing_utils.calculate_video_level_scores_by_subgroup(
+        utils.process_utils.calculate_video_level_scores_by_subgroup(
             survey_results_df,
             subgroup_col=col,
             min_participants=20,
@@ -207,7 +212,7 @@ def main():
     }
 
     # Plot subgroup metrics with bootstrap confidence intervals and save the figure
-    utils.plotting_utils.plot_subgroup_metrics_bootstrap(
+    utils.plot_utils.plot_subgroup_metrics_bootstrap(
         files=files,
         subgroup_cols=subgroup_cols,
         metrics=metrics,
@@ -238,14 +243,14 @@ def main():
         "pf_nf_label_entropy"
     ]
 
-    utils.plotting_utils.plot_metric_correlations(
+    utils.plot_utils.plot_metric_correlations(
         df=video_level_scores,
         cols_to_plot=metric_cols,
         output_dir=output_dir / "diagnostic_analysis.png"
     )
 
     # Plot valence and arousal distributions by observer experience (OE)
-    utils.plotting_utils.plot_valence_arousal_by_oe(
+    utils.plot_utils.plot_valence_arousal_by_oe(
         survey_results_df,
         oe_col=c.OE,
         oe_order=c.OE_ORDER,
@@ -256,7 +261,7 @@ def main():
     )
 
     # Plot disagreement geometry vs. PF/NF label entropy and save the figure
-    utils.plotting_utils.plot_disagreement_geometry_vs_cues(
+    utils.plot_utils.plot_disagreement_geometry_vs_cues(
         video_level_scores,
         save_path=output_dir / "metrics_vs_cues_valence.png",
         video_col=c.VIDEO_ID_COL,
