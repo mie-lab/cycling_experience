@@ -1,9 +1,9 @@
 import configparser
-import utils.helper_functions
+import utils.helper_utils
 import utils.lmm_utils
-import utils.plotting_utils
-import utils.processing_utils
-import utils.physiological_data_utils
+import utils.plot_utils
+import utils.process_utils
+import utils.physio_utils
 import logging
 import constants as c
 import numpy as np
@@ -35,29 +35,31 @@ def main():
     lab_results_file = Path(config["filenames"]["lab_study_results_file"])
     lab_sequence_file = Path(config['filenames']['lab_video_sequence_file'])
     lab_setup_file = Path(config['filenames']['lab_experiment_setup_file'])
+    physio_file = Path(config["filenames"]["physiological_results_file"])
 
     # Define and create the output directory.
     output_dir = Path(config['paths']['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     OPT = "powell"
-    PHYSIO_EXCLUDE = {0, 3, 12, 24}
+    PHYSIO_EXCLUDE = {0, 3, 12, 24}  # recording failure (0, 3, 24), medical reason (12)
+    # Raw levels: participant random intercepts absorb individual baselines
+    PHYSIO_METRICS = ["SCR_Peaks_Amplitude_Mean", "SCL_Mean", "PPG_Rate_Mean", "HRV_RMSSD"]
+    SCR = "SCR_Peaks_Amplitude_Mean"  # skewed: log1p-transformed for the analyses
 
     # ==============================================================================
     # PHASE 1: LOAD DATA
     # ==============================================================================
 
-    log.info("Phase 1.1: Online survey (validation reference)")
-
-    df_physio = pd.read_csv(Path(config["filenames"]["physiological_results_file"]))
+    log.info("Phase 1.1: Load online survey (validation reference)")
 
     survey_df = pd.read_excel(online_results_file).set_index(c.PARTICIPANT_ID)
     online_seq_df = pd.read_csv(online_sequence_file, parse_dates=['seq_start', 'seq_end'])
 
-    survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, online_seq_df, id_col=c.PARTICIPANT_ID)
-    survey_results_df = utils.processing_utils.filter_results(survey_results_df)
-    survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
-    survey_results_df = utils.processing_utils.aggregate_by_characteristics(
+    survey_results_df = utils.process_utils.transform_to_long_df(survey_df, online_seq_df, id_col=c.PARTICIPANT_ID)
+    survey_results_df = utils.process_utils.filter_results(survey_results_df)
+    survey_results_df = utils.process_utils.add_valence_arousal(survey_results_df)
+    survey_results_df = utils.process_utils.agg_by_chars(
         survey_results_df,
         age=True,
         gender=True,
@@ -69,691 +71,441 @@ def main():
         is_swiss=True
     )
 
-    online_video_level_scores = utils.processing_utils.calculate_video_level_scores(survey_results_df, lab_bool=True)
-    online_video_level_scores = online_video_level_scores.rename(columns={c.VALENCE: 'valence_online', c.AROUSAL: 'arousal_online'})
+    online_video_level_scores = utils.process_utils.calc_video_level_scores(survey_results_df, lab_bool=True)
+    online_video_level_scores = online_video_level_scores.rename(
+        columns={
+            c.VALENCE: 'valence_online',
+            c.AROUSAL: 'arousal_online'
+        }
+    )
+    n_online_ratings = survey_results_df.groupby(c.VIDEO_ID_COL).size()
+    log.info(f"Online survey: {survey_results_df[c.PARTICIPANT_ID].nunique()} respondents, "
+             f"{len(online_video_level_scores)} clips, "
+             f"{n_online_ratings.min()}-{n_online_ratings.max()} ratings per clip")
 
-    log.info("Phase 1.2: Lab study (ratings + demographics)")
+    log.info("Phase 1.2: Load lab study (ratings + demographics)")
 
     lab_results_df = pd.read_excel(lab_results_file).set_index(c.PARTICIPANT_ID, drop=True)
-    lab_results_df = utils.processing_utils.aggregate_by_characteristics(
+    lab_results_df = utils.process_utils.agg_by_chars(
         lab_results_df,
         cycling_frequency=True,
         cycling_confidence=True,
         cycling_purpose=True)
 
-    demographics_df = lab_results_df[[col for col in c.DEMOGRAPHIC_COLUMNS if col != c.IS_SWISS]]
+    demo_cols = [col for col in c.DEMOGRAPHIC_COLUMNS if col != c.IS_SWISS]
+    demographics_df = lab_results_df[demo_cols]
 
     lab_results_df = (
         lab_results_df
         .replace(r'\s*\((best|worst) experience\)', '', regex=True)
-        .drop(columns=[col for col in c.DEMOGRAPHIC_COLUMNS if col != c.IS_SWISS] + [c.START, c.END])
+        .drop(columns=demo_cols + [c.START, c.END])
         .apply(pd.to_numeric, errors='coerce')
     )
+    log.info(f"Lab study: {len(lab_results_df)} participants, {lab_results_df.shape[1]} rating/ranking columns, "
+             f"{int(lab_results_df.isna().sum().sum())} missing or non-numeric values")
 
-    log.info("Phase 1.3: Sequence, setup, and prediction files")
+    for col in demo_cols:
+        shares = demographics_df[col].value_counts(normalize=True, dropna=False).mul(100).round(1)
+        log.info(f"  {col} (%): {shares.to_dict()}")
+
+    log.info("Phase 1.3: Load sequence, setup, prediction, and physiology files")
 
     lab_seq_df = pd.read_csv(lab_sequence_file)
     experiment_setup = pd.read_csv(lab_setup_file, header=None).set_index(0, drop=True)
     video_score_predictions = pd.read_csv(video_predictions_file)
 
-    PHYSIO_METRICS = ["SCR_Peaks_Amplitude_Mean", "SCL_Delta", "PPG_Rate_Mean", "HRV_RMSSD"]
+    df_physio = pd.read_csv(physio_file)
 
-    phys2 = utils.physiological_data_utils.get_physio_trial_df(df_physio, experiment_setup,
-                                                               c.TRIAL_2_PARAMS["trial_label"], PHYSIO_METRICS)
-    phys3 = utils.physiological_data_utils.get_physio_trial_df(df_physio, experiment_setup,
-                                                               c.TRIAL_3_PARAMS["trial_label"], PHYSIO_METRICS)
-    phys4 = utils.physiological_data_utils.get_physio_trial_df(df_physio, experiment_setup,
-                                                               c.TRIAL_4_PARAMS["trial_label"], PHYSIO_METRICS)
+    # Physio segment k is mapped to presentation slot k: flag segments whose duration does not fit
+    misaligned = utils.physio_utils.check_segment_alignment(df_physio, experiment_setup)
+    if not misaligned.empty:
+        log.warning(f"Physio segments not matching their slot:\n{misaligned.to_string(index=False)}")
+
+    # Drop excluded participants and misaligned segments; log-transform the skewed SCR
+    misaligned_ids = set(zip(misaligned[c.PARTICIPANT_ID], misaligned['slot']))
+    keep = [
+        pid not in PHYSIO_EXCLUDE and (pid, slot) not in misaligned_ids
+        for pid, slot in zip(df_physio[c.PARTICIPANT_ID], df_physio['segment_id'])
+    ]
+    df_physio = df_physio[keep].copy()
+    df_physio[SCR] = np.log1p(df_physio[SCR].clip(lower=0))
+
+    phys3 = utils.physio_utils.get_physio_trial_df(df_physio, experiment_setup,
+                                                   c.TRIAL_3_PARAMS["trial_label"], PHYSIO_METRICS)
+    phys4 = utils.physio_utils.get_physio_trial_df(df_physio, experiment_setup,
+                                                   c.TRIAL_4_PARAMS["trial_label"], PHYSIO_METRICS)
+    for label, d in (("bikeable block", phys3), ("non-bikeable block", phys4)):
+        log.info(f"Physio {label}: {len(d)} sequences from {d[c.PARTICIPANT_ID].nunique()} participants")
 
     # ==============================================================================
-    # STAGE 1: STIMULUS VALIDATION (Task 1 single-clip ratings)
+    # PHASE 2: STIMULUS VALIDATION (Task 1 single-clip ratings)
     # ==============================================================================
-    log.info("\n--- Stage 1: Stimulus validation ---")
+    log.info("Phase 2: Stimulus validation")
 
-    # Task 1 ratings -> long -> valence/arousal -> clip-level means
-    df_baseline = utils.helper_functions.get_trial_dict(
+    task1 = utils.helper_utils.get_trial_dict(
         lab_results_df, experiment_setup, c.TRIAL_1, c.VIDEO_COUNTS
     )
-    df1 = utils.helper_functions.trial_dict_to_df(df_baseline)
-    df1 = utils.processing_utils.add_valence_arousal(df1, ag_col='rating')
+    df1 = utils.helper_utils.trial_dict_to_df(task1)
+    df1 = utils.process_utils.add_valence_arousal(df1, ag_col='rating')
 
-    df_physio_clips = utils.physiological_data_utils.map_physiological_segments_to_videos(
-        df_physio, experiment_setup, c.TRIAL_1, c.VIDEO_COUNTS)
-    df_physio_clips = df_physio_clips[[c.PARTICIPANT_ID, c.VIDEO_ID_COL] + PHYSIO_METRICS]
+    clip_types = utils.helper_utils.get_clip_types(lab_seq_df)
+    validated_ids = survey_results_df[c.VIDEO_ID_COL].unique()
+    df1['clip_type'] = df1[c.VIDEO_ID_COL].map(clip_types)
+    df1['extension'] = (~df1[c.VIDEO_ID_COL].isin(validated_ids)).astype(int)
+    df1['group'] = 1
 
-    df1 = df1.merge(df_physio_clips, on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL], how="left")
+    # NB - B per clip set
+    random_effects = {
+        'participant': f'0 + C({c.PARTICIPANT_ID})',
+        'clip': f'0 + C({c.VIDEO_ID_COL})'
+    }
+    nb = 'C(clip_type)[T.NB]'
+    nb_x_extension = 'C(clip_type)[T.NB]:extension'
+    contrasts = {
+        'validated': {nb: 1},
+        'extension': {nb: 1, nb_x_extension: 1},
+        'difference': {nb_x_extension: 1},
+    }
+    manipulation_check = []
+    for outcome in [c.VALENCE, c.AROUSAL]:
+        model = utils.lmm_utils.run_lmm(
+            df=df1, formula=f"{outcome} ~ C(clip_type) * extension",
+            groups_col='group', vc_formula=random_effects,
+            convergence_method=OPT, verbose=False
+        )
+        for clip_set, weights in contrasts.items():
+            result = utils.lmm_utils.lmm_contrast(model, weights)
+            manipulation_check.append({'outcome': outcome, 'clip_set': clip_set, **result})
+    manipulation_check = pd.DataFrame(manipulation_check)
+    manipulation_check.to_csv(output_dir / 'task1_manipulation_check.csv', index=False)
+    log.info(f"Manipulation check (NB - B):\n{manipulation_check.round(3)}")
 
-    lab_video_scores = utils.processing_utils.calculate_video_level_scores(df1, lab_bool=True)
-
-    # Lab-sample valence–arousal coupling (clip-level Pearson)
-    va_r = lab_video_scores[['valence', 'arousal']].corr(method='pearson').iloc[0, 1]
-    log.info(f"Lab-sample valence–arousal coupling (clip-level Pearson): r = {va_r:.3f}")
-
-    # Merge lab <- online <- k-NN prediction, keyed on clip id
+    # Clip-level means: lab, online survey, k-NN prediction
     video_level_scores = (
-        lab_video_scores
+        utils.process_utils.calc_video_level_scores(df1, lab_bool=True)
         .merge(online_video_level_scores, on=c.VIDEO_ID_COL, how='left')
         .merge(video_score_predictions, on=c.VIDEO_ID_COL, how='left')
     )
-    video_level_scores.to_csv(output_dir / 'stage1_clip_validation.csv', index=False)
+    video_level_scores.to_csv(output_dir / 'task1_clip_validation.csv', index=False)
 
-    # Agreement metrics (valence has a prediction; arousal does not)
-    val_metrics = utils.helper_functions.get_video_level_metrics(
-        video_level_scores, c.VALENCE, 'valence_prediction', 'valence_online'
-    )
-    aro_metrics = utils.helper_functions.get_video_level_metrics(
-        video_level_scores, c.AROUSAL, 'arousal_prediction', 'arousal_online'
-    )
-    pd.DataFrame({'valence': val_metrics, 'arousal': aro_metrics}).to_csv(
-        output_dir / 'stage1_agreement_metrics.csv'
-    )
+    # Valence-arousal coupling on the validated clips
+    validated = video_level_scores.dropna(subset=['valence_online'])
+    lab_r = validated['valence'].corr(validated['arousal'])
+    online_r = validated['valence_online'].corr(validated['arousal_online'])
+    log.info(f"Valence-arousal r: lab {lab_r:.2f}, online {online_r:.2f}")
 
-    # Bland–Altman absolute-agreement plots (lab vs online), both axes
-    ba_val = utils.plotting_utils.plot_bland_altman(
-        df=video_level_scores, measurement1='valence', measurement2='valence_online',
-        label_col=c.VIDEO_ID_COL, save_path=output_dir / 'stage1_bland_altman_valence.png'
-    )
-    ba_aro = utils.plotting_utils.plot_bland_altman(
-        df=video_level_scores, measurement1='arousal', measurement2='arousal_online',
-        label_col=c.VIDEO_ID_COL, save_path=output_dir / 'stage1_bland_altman_arousal.png'
-    )
-    pd.DataFrame({'valence': ba_val, 'arousal': ba_aro}).to_csv(
-        output_dir / 'stage1_bland_altman_stats.csv'
-    )
-    log.info(f"Bland–Altman valence: bias={ba_val['bias']:.3f}, "
-             f"LoA=[{ba_val['lower_loa']:.3f}, {ba_val['upper_loa']:.3f}]")
-    log.info(f"Bland–Altman arousal: bias={ba_aro['bias']:.3f}, "
-             f"LoA=[{ba_aro['lower_loa']:.3f}, {ba_aro['upper_loa']:.3f}]")
+    # Agreement: lab vs online and lab vs k-NN; Bland-Altman on validated clips only
+    agreement = {}
+    for outcome in [c.VALENCE, c.AROUSAL]:
+        online_col = f'{outcome}_online'
+        metrics = utils.helper_utils.get_video_level_metrics(
+            video_level_scores, outcome, f'{outcome}_prediction', online_col
+        )
+        bland_altman = utils.plot_utils.plot_bland_altman(
+            df=video_level_scores, measurement1=outcome, measurement2=online_col,
+            label_col=c.VIDEO_ID_COL,
+            save_path=output_dir / f'task1_bland_altman_{outcome}.png'
+        )
+        agreement[outcome] = {**metrics, **bland_altman}
+    agreement = pd.DataFrame(agreement)
+    agreement.to_csv(output_dir / 'task1_agreement_metrics.csv')
+    log.info(f"Agreement:\n{agreement.round(3)}")
 
-    utils.plotting_utils.plot_clip_affect_space(
-        video_level_scores,
-        save_path=output_dir / 'stage1_clip_affect_space.png'
+    # Physiology per clip (exploratory)
+    phys1 = utils.physio_utils.get_physio_trial_df(df_physio, experiment_setup, c.TRIAL_1, PHYSIO_METRICS)
+    phys1[c.VIDEO_ID_COL] = phys1['sequence_code'].str.extract(r'video_(\d+)', expand=False).astype(int)
+    df1_physio = df1.merge(
+        phys1.drop(columns='sequence_code'), on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL]
     )
+    log.info(f"Physio clips: {len(df1_physio)} from {df1_physio[c.PARTICIPANT_ID].nunique()} participants")
+
+    # NB - B per metric (same LMM as the ratings) and repeated-measures correlations;
+    # segment_id (presentation slot) absorbs the drift of the signals over the session
+    physio_check = []
+    for metric in PHYSIO_METRICS:
+        model = utils.lmm_utils.run_lmm(
+            df=df1_physio.dropna(subset=[metric]), formula=f"{metric} ~ C(clip_type) + segment_id",
+            groups_col='group', vc_formula=random_effects,
+            convergence_method=OPT, verbose=False
+        )
+        physio_check.append({'metric': metric, **utils.lmm_utils.lmm_contrast(model, {nb: 1})})
+    physio_check = pd.DataFrame(physio_check)
+    physio_check['p_holm'] = multipletests(physio_check['p'], method='holm')[1]
+    physio_check.to_csv(output_dir / 'task1_physio_manipulation_check.csv', index=False)
+    log.info(f"Physio NB - B:\n{physio_check.round(3).to_string(index=False)}")
+
+    physio_corr = utils.helper_utils.rm_corr_table(
+        df1_physio, c.PARTICIPANT_ID, PHYSIO_METRICS, [c.VALENCE, c.AROUSAL], control='segment_id'
+    )
+    physio_corr.to_csv(output_dir / 'task1_physio_rating_correlations.csv', index=False)
+    log.info(f"Physio-rating correlations:\n{physio_corr.round(3).to_string(index=False)}")
 
     # ==============================================================================
-    # STAGE 2 (TASK 2): TWO-SEGMENT ORDER BLOCK - ranking + valence/arousal trends
+    # PHASE 3: TWO-SEGMENT ORDER (Task 2)
     # ==============================================================================
-    log.info("\n--- Task 2: two-segment order block ---")
+    log.info("Phase 3: Two-segment order")
 
-    df_two = utils.helper_functions.load_and_process_trial_data(
+    df_two = utils.helper_utils.load_and_process_trial_data(
         lab_results_df, experiment_setup, lab_seq_df, c.TRIAL_2_PARAMS, video_level_scores
     )
-    df_two = pd.merge(df_two, demographics_df, on=c.PARTICIPANT_ID, how='left')
+    df_two['sequence_type'] = df_two['sequence_list'].str.join(' → ')
 
-    # Four-level pair factor (shared with the later LMM and the plots)
-    df_two['pair'] = df_two['sequence_list'].apply(lambda s: ' \u2192 '.join(map(str, s)))
-    df_two['sequence_type'] = df_two['pair']
-
-    df_two = df_two.merge(phys2, left_on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL],
-                          right_on=[c.PARTICIPANT_ID, "sequence_code"], how="left")
-
-    # --- Descriptive trend (valence + arousal); arousal shows the sequence effect clearly
-    utils.plotting_utils.plot_sequence_trend_panels(
-        df_two, sequence_order=c.TRIAL_2_PLOT_ORDER, estimator="mean",
+    utils.plot_utils.plot_sequence_trend_panels(
+        df_two, sequence_order=c.TRIAL_2_PLOT_ORDER, estimator='mean',
         save_path=output_dir / 'task2_trends_CI.png'
     )
 
-    # --- Recalled ranking: distribution plot + order tests (Wilcoxon)
-    utils.plotting_utils.plot_ranking_distribution(
-        df_two, pair_col='pair', ranking_col='ranking',
-        sequence_order=c.TRIAL_2_PLOT_ORDER,
-        save_path=output_dir / 'task2_ranking_distribution.png'
-    )
+    # M1: B → NB - NB → B, with participant random intercepts
+    order_weights = {
+        'C(sequence_type)[T.B → NB]': 1,
+        'C(sequence_type)[T.NB → B]': -1
+    }
+    m1 = []
+    for outcome in [c.VALENCE, c.AROUSAL]:
+        model = utils.lmm_utils.run_lmm(
+            df=df_two, formula=f"{outcome} ~ C(sequence_type)",
+            groups_col=c.PARTICIPANT_ID,
+            convergence_method=OPT, verbose=False
+        )
+        result = utils.lmm_utils.lmm_contrast(model, order_weights)
+        m1.append({'outcome': outcome, **result})
+    m1 = pd.DataFrame(m1)
+    m1.to_csv(output_dir / 'task2_M1_participant_intercept.csv', index=False)
+    log.info(f"M1 (B → NB - NB → B):\n{m1.round(3)}")
 
-    # Order tests (NB→B vs B→NB) on ranking, valence, arousal
-    w_rank = utils.helper_functions.wilcoxon_pair(
-        df_two, c.PARTICIPANT_ID, 'pair', 'ranking', 'NB \u2192 B', 'B \u2192 NB'
+    # Planned contrasts for Table 3, extended with Task 3
+    all_contrasts = m1.assign(
+        task='Task 2', contrast='B_to_NB_vs_NB_to_B', p_holm=np.nan
+    ).to_dict('records')
+
+    # Delayed rankings: B → NB - NB → B (positive = B → NB ranked worse)
+    ranking = utils.helper_utils.wilcoxon_pair(
+        df_two, c.PARTICIPANT_ID, 'sequence_type', 'ranking', 'B → NB', 'NB → B'
     )
-    w_val = utils.helper_functions.wilcoxon_pair(
-        df_two, c.PARTICIPANT_ID, 'pair', 'valence', 'NB \u2192 B', 'B \u2192 NB'
-    )
-    w_aro = utils.helper_functions.wilcoxon_pair(
-        df_two, c.PARTICIPANT_ID, 'pair', 'arousal', 'NB \u2192 B', 'B \u2192 NB'
-    )
-    for label, w in [("ranking", w_rank), ("valence", w_val), ("arousal", w_aro)]:
-        log.info(f"Order ({label}): {w}")
-    pd.DataFrame([w_val, w_aro, w_rank]).to_csv(output_dir / 'task2_order_wilcoxon.csv', index=False)
+    ranking = pd.DataFrame([ranking])
+    ranking.to_csv(output_dir / 'task2_ranking_wilcoxon.csv', index=False)
+    log.info(f"Ranking (Wilcoxon):\n{ranking.round(3).to_string(index=False)}")
 
     # ==============================================================================
-    # STAGE 2 (TASK 3): POSITIVE BLOCK — NB spoiler in a bikeable context
+    # PHASE 4: THREE-SEGMENT SEQUENCES (Task 3)
     # ==============================================================================
-    log.info("\n--- Task 3: Positive block (NB spoiler) ---")
+    log.info("Phase 4: Three-segment sequences")
 
-    df_positive = utils.helper_functions.load_and_process_trial_data(
+    # Positive block: NB off-type segment in a bikeable route
+
+    df_positive = utils.helper_utils.load_and_process_trial_data(
         lab_results_df, experiment_setup, lab_seq_df,
         c.TRIAL_3_PARAMS, video_level_scores, 'NB'
     )
-    df_positive = pd.merge(df_positive, demographics_df, on=c.PARTICIPANT_ID, how='left')
-    df_positive['sequence_type'] = df_positive['sequence_list'].apply(lambda s: ' \u2192 '.join(map(str, s)))
-    df_positive['spoiler_position'] = df_positive['NB_position']  # 0 = baseline, 1-3 = spoiler position
+    df_positive['sequence_type'] = df_positive['sequence_list'].str.join(' \u2192 ')
+    df_positive = df_positive.merge(
+        phys3, left_on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL],
+        right_on=[c.PARTICIPANT_ID, 'sequence_code'], how='left'
+    )
 
-    df_positive = df_positive.merge(phys3, left_on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL],
-                                    right_on=[c.PARTICIPANT_ID, "sequence_code"], how="left")
-
-    utils.plotting_utils.plot_sequence_trend_panels(
-        df_positive, sequence_order=c.TRIAL_3_PLOT_ORDER, estimator="mean",
+    utils.plot_utils.plot_sequence_trend_panels(
+        df_positive, sequence_order=c.TRIAL_3_PLOT_ORDER, estimator='mean',
         save_path=output_dir / 'task3_positive_trends_CI.png'
     )
-    utils.plotting_utils.plot_ranking_distribution(
-        df_positive, pair_col='sequence_type', ranking_col='ranking',
-        sequence_order=c.TRIAL_3_PLOT_ORDER,
-        save_path=output_dir / 'task3_positive_ranking_distribution.png'
-    )
 
-    # Position effect on recalled ranking (spoiler positions only, baseline excluded)
-    #fk_pos = utils.helper_functions.friedman_kendall(
-    #    df_positive[df_positive['spoiler_position'] != 0],
-    #    subject_col=c.PARTICIPANT_ID, condition_col='spoiler_position', value_col='ranking'
-    #)
-    #log.info(f"Positive ranking, position effect — Friedman chi2={fk_pos['chi2']:.2f}, "
-    #         f"df={fk_pos['df']}, p={fk_pos['p']:.4g}, Kendall W={fk_pos['kendall_w']:.3f} "
-    #         f"(n={fk_pos['n_subjects']}, k={fk_pos['n_conditions']})")
-    #pd.DataFrame([fk_pos]).to_csv(output_dir / 'task3_positive_ranking_friedman.csv', index=False)
-
-    # Page's trend test: do later spoiler positions get progressively worse ranks?
-    # predicted_order = [1, 2, 3]  (recency => position 3 ranked worst)
-    pt_pos = utils.helper_functions.page_trend_ranking(
-        df_positive[df_positive['spoiler_position'] != 0],
-        subject_col=c.PARTICIPANT_ID, condition_col='spoiler_position',
+    # Page's trend test on rankings: recency predicts a late NB segment ranked worst
+    page_positive = utils.helper_utils.page_trend_ranking(
+        df_positive[df_positive['off_type_position'] != 0],
+        subject_col=c.PARTICIPANT_ID, condition_col='off_type_position',
         value_col='ranking', predicted_order=[1, 2, 3]
     )
-    log.info(f"Positive ranking, Page trend — L={pt_pos['L']:.1f}, p={pt_pos['p']:.4g}, "
-             f"mean ranks={pt_pos['mean_rank_by_condition']} "
-             f"(n={pt_pos['n_subjects']}, dropped={pt_pos['n_dropped']})")
-    pd.DataFrame([pt_pos]).to_csv(output_dir / 'task3_positive_ranking_page.csv', index=False)
+    page_positive = pd.DataFrame([page_positive])
+    page_positive.to_csv(output_dir / 'task3_positive_ranking_page.csv', index=False)
+    log.info(f"Page's trend test, Positive block:\n{page_positive.round(3).to_string(index=False)}")
 
-    # ==============================================================================
-    # STAGE 2 (TASK 3): NEGATIVE BLOCK — B spoiler in a non-bikeable context
-    # ==============================================================================
-    log.info("\n--- Task 3: Negative block (B spoiler) ---")
+    # Negative block: B off-type segment in a non-bikeable route
 
-    df_negative = utils.helper_functions.load_and_process_trial_data(
+    df_negative = utils.helper_utils.load_and_process_trial_data(
         lab_results_df, experiment_setup, lab_seq_df,
         c.TRIAL_4_PARAMS, video_level_scores, 'B'
     )
-    df_negative = pd.merge(df_negative, demographics_df, on=c.PARTICIPANT_ID, how='left')
-    df_negative['sequence_type'] = df_negative['sequence_list'].apply(lambda s: ' \u2192 '.join(map(str, s)))
-    df_negative['spoiler_position'] = df_negative['B_position']  # 0 = baseline, 1-3 = spoiler position
+    df_negative['sequence_type'] = df_negative['sequence_list'].str.join(' \u2192 ')
+    df_negative = df_negative.merge(
+        phys4, left_on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL],
+        right_on=[c.PARTICIPANT_ID, 'sequence_code'], how='left'
+    )
 
-    df_negative = df_negative.merge(phys4, left_on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL],
-                                    right_on=[c.PARTICIPANT_ID, "sequence_code"], how="left")
-
-    utils.plotting_utils.plot_sequence_trend_panels(
-        df_negative, sequence_order=c.TRIAL_4_PLOT_ORDER, estimator="mean",
+    utils.plot_utils.plot_sequence_trend_panels(
+        df_negative, sequence_order=c.TRIAL_4_PLOT_ORDER, estimator='mean',
         save_path=output_dir / 'task3_negative_trends_CI.png'
     )
-    utils.plotting_utils.plot_ranking_distribution(
-        df_negative, pair_col='sequence_type', ranking_col='ranking',
-        sequence_order=c.TRIAL_4_PLOT_ORDER,
-        save_path=output_dir / 'task3_negative_ranking_distribution.png'
+
+    # Page's trend test on rankings: recency predicts a late B segment ranked best
+    page_negative = utils.helper_utils.page_trend_ranking(
+        df_negative[df_negative['off_type_position'] != 0],
+        subject_col=c.PARTICIPANT_ID, condition_col='off_type_position',
+        value_col='ranking', predicted_order=[3, 2, 1]
     )
+    page_negative = pd.DataFrame([page_negative])
+    page_negative.to_csv(output_dir / 'task3_negative_ranking_page.csv', index=False)
+    log.info(f"Page's trend test, Negative block:\n{page_negative.round(3).to_string(index=False)}")
 
-    #fk_neg = utils.helper_functions.friedman_kendall(
-    #    df_negative[df_negative['spoiler_position'] != 0],
-    #    subject_col=c.PARTICIPANT_ID, condition_col='spoiler_position', value_col='ranking'
-    #)
-    #log.info(f"Negative ranking, position effect — Friedman chi2={fk_neg['chi2']:.2f}, "
-    #         f"df={fk_neg['df']}, p={fk_neg['p']:.4g}, Kendall W={fk_neg['kendall_w']:.3f} "
-    #         f"(n={fk_neg['n_subjects']}, k={fk_neg['n_conditions']})")
-    #pd.DataFrame([fk_neg]).to_csv(output_dir / 'task3_negative_ranking_friedman.csv', index=False)
-
-    pt_neg = utils.helper_functions.page_trend_ranking(
-        df_negative[df_negative['spoiler_position'] != 0],
-        subject_col=c.PARTICIPANT_ID, condition_col='spoiler_position',
-        value_col='ranking', predicted_order=[1, 2, 3]
-    )
-    log.info(f"Negative ranking, Page trend — L={pt_neg['L']:.1f}, p={pt_neg['p']:.4g}, "
-             f"mean ranks={pt_neg['mean_rank_by_condition']} "
-             f"(n={pt_neg['n_subjects']}, dropped={pt_neg['n_dropped']})")
-    pd.DataFrame([pt_neg]).to_csv(output_dir / 'task3_negative_ranking_page.csv', index=False)
-
-
-    utils.plotting_utils.plot_ranking_distribution_combined(
-        blocks=[
-            (df_two, "Two-segment routes", c.TRIAL_2_PLOT_ORDER),
-            (df_positive, "Three-segment: Positive", c.TRIAL_3_PLOT_ORDER),
-            (df_negative, "Three-segment: Negative", c.TRIAL_4_PLOT_ORDER),
-        ],
-        save_path=output_dir / 'ranking_distribution_combined.png'
-    )
-
-    for name, d in [("base", df1), ("two", df_two), ("pos", df_positive), ("neg", df_negative)]:
-        log.info(f"physio coverage [{name}]: {d['SCL_Delta'].notna().sum()}/{len(d)}")
-
-
-    # ==============================================================================
-    # Physio inspection
-    # ==============================================================================
-
-    frames = {"base": df1, "two": df_two, "pos": df_positive, "neg": df_negative}
-    miss_tbl = utils.physiological_data_utils.physio_missing_by_participant(frames)
-    log.info(f"\nPhysio missing counts per participant:\n{miss_tbl.to_string()}")
-    miss_tbl.to_csv(output_dir / "physio_missing_by_participant.csv")
-
-    # ==========================================================================
-    # LMM PHASE — Tasks 2 & 3
-    # ==========================================================================
-    log.info("\n--- LMM phase: Tasks 2 & 3 ---")
-
-    df_combined = utils.processing_utils.prepare_combined_scenario_df(df_positive, df_negative)
-    df_combined["spoiler_position"] = pd.to_numeric(df_combined["spoiler_position"], errors="coerce")
-
-    for o in [c.VALENCE, c.AROUSAL]:
-        seg = df_combined[[f"pos1_{o}", f"pos2_{o}", f"pos3_{o}"]].to_numpy()
-        assert np.allclose(df_combined[f"mean_{o}"], seg.mean(axis=1), atol=1e-2, equal_nan=True)
-        assert np.allclose(df_combined[f"pos_peak_{o}"], seg.max(axis=1), atol=1e-2)
-        assert np.allclose(df_combined[f"neg_peak_{o}"], seg.min(axis=1), atol=1e-2)
-        assert np.allclose(df_combined[f"end_{o}"], df_combined[f"pos3_{o}"], atol=1e-2)
-    log.info(f"Feature construction verified. N obs = {len(df_combined)}")
-
-    # --- Contrast / EMM specifications (shared across outcomes) ---
-    position = "C(spoiler_position)"
-    scenario = "C(scenario)[T.Positive]"
-
-    contrast_specs = {
-        "neg_p1_vs_base": {f"{position}[T.1]": 1},
-        "neg_p2_vs_base": {f"{position}[T.2]": 1},
-        "neg_p3_vs_base": {f"{position}[T.3]": 1},
-        "neg_p3_vs_p1": {f"{position}[T.3]": 1, f"{position}[T.1]": -1},
-        "pos_p1_vs_base": {f"{position}[T.1]": 1, f"{position}[T.1]:{scenario}": 1},
-        "pos_p2_vs_base": {f"{position}[T.2]": 1, f"{position}[T.2]:{scenario}": 1},
-        "pos_p3_vs_base": {f"{position}[T.3]": 1, f"{position}[T.3]:{scenario}": 1},
-        "pos_p3_vs_p1": {f"{position}[T.3]": 1, f"{position}[T.1]": -1,
-                         f"{position}[T.3]:{scenario}": 1, f"{position}[T.1]:{scenario}": -1},
-        "rq2_magnitude": {f"{position}[T.1]": -2 / 3, f"{position}[T.2]": -2 / 3, f"{position}[T.3]": -2 / 3,
-                          f"{position}[T.1]:{scenario}": -1 / 3,
-                          f"{position}[T.2]:{scenario}": -1 / 3,
-                          f"{position}[T.3]:{scenario}": -1 / 3},
-    }
-    PLANNED_FAMILIES = {"neg_p3_vs_p1", "pos_p3_vs_p1", "rq2_magnitude"}
-    emm_specs = {
-        ("Negative", 0): {"Intercept": 1},
-        ("Negative", 1): {"Intercept": 1, f"{position}[T.1]": 1},
-        ("Negative", 2): {"Intercept": 1, f"{position}[T.2]": 1},
-        ("Negative", 3): {"Intercept": 1, f"{position}[T.3]": 1},
-        ("Positive", 0): {"Intercept": 1, scenario: 1},
-        ("Positive", 1): {"Intercept": 1, f"{position}[T.1]": 1, scenario: 1, f"{position}[T.1]:{scenario}": 1},
-        ("Positive", 2): {"Intercept": 1, f"{position}[T.2]": 1, scenario: 1, f"{position}[T.2]:{scenario}": 1},
-        ("Positive", 3): {"Intercept": 1, f"{position}[T.3]": 1, scenario: 1, f"{position}[T.3]:{scenario}": 1},
-    }
-
-    covariates = ["Gender", "Age", "Cycling_confidence",
-                  "Cycling_frequency", "Cycling_purpose", "Cycling_environment"]
-
-    all_contrasts = []
+    # Pooled position model (M2): both blocks together
+    df_combined = utils.process_utils.prepare_combined_scenario_df(df_positive, df_negative)
+    df_combined = df_combined.merge(demographics_df, on=c.PARTICIPANT_ID, how='left')
+    blocks = ('Negative', 'Positive')
+    demographic_tests = []
 
     for OUTCOME in ["valence", "arousal"]:
         log.info(f"\n{'=' * 50}\n{OUTCOME.upper()}\n{'=' * 50}")
-        peak, neg, end = f"pos_peak_{OUTCOME}", f"neg_peak_{OUTCOME}", f"end_{OUTCOME}"
+        covariate = utils.process_utils.add_off_type_covariate(df_combined, OUTCOME)
 
-        pos = df_combined["spoiler_position"].astype("Int64")
-        raw = pd.Series(np.nan, index=df_combined.index, dtype=float)
-        for k in (1, 2, 3):
-            m = pos == k
-            raw[m] = df_combined.loc[m, f"pos{k}_{OUTCOME}"]
-        df_combined[f"spoiler_{OUTCOME}_cb"] = (
-                raw - raw.groupby(df_combined["scenario"]).transform("mean")
-        ).fillna(0.0)
-
-        # Recency-weighted aggregation feature: linear position contrast (-1, 0, +1)
-        df_combined[f"recency_{OUTCOME}"] = (
-                -1.0 * df_combined[f"pos1_{OUTCOME}"]
-                + 0.0 * df_combined[f"pos2_{OUTCOME}"]
-                + 1.0 * df_combined[f"pos3_{OUTCOME}"]
+        # M2: Y ~ position x scenario + off-type intensity + (1 | participant)
+        m2_formula = f"{OUTCOME} ~ C(off_type_position) * C(scenario) + {covariate}"
+        m2 = utils.lmm_utils.run_lmm(
+            df=df_combined, formula=m2_formula,
+            groups_col=c.PARTICIPANT_ID, convergence_method=OPT, verbose=False
+        )
+        utils.plot_utils.plot_lmm_diagnostics(
+            m2, f"M2 ({OUTCOME})", output_dir / f"diagnostics_M2_{OUTCOME}.png"
         )
 
-        # ==================================================================
-        # STAGE 2 — Task 2 two-segment order effect (RQ1)
-        # ==================================================================
-        m_task2 = utils.lmm_utils.run_lmm(
-            df=df_two, formula=f"{OUTCOME} ~ C(pair)",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-        order_ct = utils.lmm_utils.lmm_contrast(
-            m_task2, {"C(pair)[T.NB → B]": 1, "C(pair)[T.B → NB]": -1})
-        all_contrasts.append({
-            "task": "Task 2 (order)", "outcome": OUTCOME,
-            "contrast": "NB_to_B_vs_B_to_NB", "family": "planned",
-            "p_holm": pd.NA, **order_ct})
-
-        # ==================================================================
-        # STAGE 3 — Task 3 pooled position
-        # ==================================================================
-        m_main = utils.lmm_utils.run_lmm(
-            df=df_combined,
-            formula=f"{OUTCOME} ~ C(spoiler_position) + C(scenario) + spoiler_{OUTCOME}_cb",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-        m_inter = utils.lmm_utils.run_lmm(
-            df=df_combined,
-            formula=f"{OUTCOME} ~ C(spoiler_position) * C(scenario) + spoiler_{OUTCOME}_cb",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-
-        utils.plotting_utils.plot_lmm_diagnostics(
-            m_inter, f"M3 ({OUTCOME})",
-            output_dir / f"diagnostics_M3_{OUTCOME}.png")
-
-        rq3 = utils.helper_functions.lr_test(m_main, m_inter, label=f"RQ3 omnibus ({OUTCOME})")
-        log.info(f"RQ3 omnibus (main vs interaction): {rq3}")
-
-        m_inter_nocov = utils.lmm_utils.run_lmm(
-            df=df_combined,
-            formula=f"{OUTCOME} ~ C(spoiler_position) * C(scenario)",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-        keep = [p for p in m_inter.params.index if "spoiler_position" in p or "scenario" in p]
-        sens_rows = []
-
-        for term in keep:
-            adj = utils.lmm_utils.lmm_contrast(m_inter, {term: 1})
-            una = utils.lmm_utils.lmm_contrast(m_inter_nocov, {term: 1})
-            sens_rows.append({
-                "term": term,
-                "est_adj": adj["estimate"], "se_adj": adj["se"], "p_adj": adj["p"],
-                "est_unadj": una["estimate"], "se_unadj": una["se"], "p_unadj": una["p"],
-                "se_ratio": adj["se"] / una["se"] if una["se"] else np.nan,
-            })
-        pd.DataFrame(sens_rows).to_csv(
-            output_dir / f"spoiler_covariate_sensitivity_{OUTCOME}.csv", index=False)
-
-        # Orient the RQ2 magnitude contrast so a positive estimate always means a
-        # negativity bias (|NB shift| > |B shift|): negate it for arousal.
-        neg_dir = 1.0 if OUTCOME == "valence" else -1.0
-        outcome_specs = dict(contrast_specs)
-        outcome_specs["rq2_magnitude"] = {
-            k: neg_dir * v for k, v in contrast_specs["rq2_magnitude"].items()
+        # Contrasts as differences between M2's predicted cell means
+        fixed_effects = m2.fe_params.index
+        cells = {
+            (b, k): utils.lmm_utils.cell_weights(fixed_effects, b, k)
+            for b in blocks for k in range(4)
         }
+        shift = {(b, k): cells[b, k] - cells[b, 0] for b in blocks for k in (1, 2, 3)}
+        nb_sign = -1 if OUTCOME == c.VALENCE else 1  # NB lowers valence, raises arousal
 
-        # Planned + descriptive contrasts (Holm within planned family), all on m_inter
-        planned_pvals, planned_idx = [], []
-        for name, spec in outcome_specs.items():
-            ct = utils.lmm_utils.lmm_contrast(m_inter, spec)
-            is_planned = name in PLANNED_FAMILIES
-            all_contrasts.append({
-                "task": "Task 3", "outcome": OUTCOME, "contrast": name,
-                "family": "planned" if is_planned else "descriptive",
-                "p_holm": pd.NA, **ct})
-            if is_planned:
-                planned_pvals.append(ct["p"])
-                planned_idx.append(len(all_contrasts) - 1)
-        if planned_pvals:
-            for i, ph in zip(planned_idx, multipletests(planned_pvals, method='holm')[1]):
-                all_contrasts[i]["p_holm"] = ph
+        # Off-type shift from baseline, averaged over positions 1-3 (one Holm family)
+        shifts = {
+            'nb_shift': sum(shift['Positive', k] for k in (1, 2, 3)) / 3,
+            'b_shift': sum(shift['Negative', k] for k in (1, 2, 3)) / 3,
+        }
+        # RQ1: late vs early off-type segment per block (one Holm family)
+        recency = {
+            'neg_p3_vs_p1': cells['Negative', 3] - cells['Negative', 1],
+            'pos_p3_vs_p1': cells['Positive', 3] - cells['Positive', 1],
+        }
+        # RQ2: |NB shift| - |B shift|; > 0 = negativity bias
+        magnitude = {'rq2_magnitude': nb_sign * (shifts['nb_shift'] + shifts['b_shift'])}
+        contrasts = pd.concat([
+            utils.lmm_utils.contrast_table(m2, shifts, holm=True),
+            utils.lmm_utils.contrast_table(m2, recency, holm=True),
+            utils.lmm_utils.contrast_table(m2, magnitude),
+        ]).rename_axis('contrast').reset_index()
+        all_contrasts += contrasts.assign(task='Task 3', outcome=OUTCOME).to_dict('records')
 
-        # EMMs for the interaction plot
-        emm_df = pd.DataFrame([
-            {"outcome": OUTCOME, "block": block, "position": pos,
-             "emm": (ct := utils.lmm_utils.lmm_contrast(m_inter, spec))["estimate"],
-             "ci_low": ct["ci_low"], "ci_high": ct["ci_high"]}
-            for (block, pos), spec in emm_specs.items()])
-
+        # Predicted means per block x position (Figure 5)
+        emm_df = utils.lmm_utils.contrast_table(m2, cells).rename(columns={'estimate': 'emm'})
+        emm_df = emm_df.rename_axis(['block', 'position']).reset_index().assign(outcome=OUTCOME)
         emm_df.to_csv(output_dir / f"EMM_table_{OUTCOME}.csv", index=False)
-        utils.plotting_utils.plot_emm_interaction(emm_df, OUTCOME, output_dir, log)
+        utils.plot_utils.plot_emm_interaction(emm_df, OUTCOME, output_dir, log)
 
-        # ==================================================================
-        # STAGE 3b — Linear position TREND (1 df), spoiler trials only
-        # ==================================================================
-        df_trend = df_combined.copy()
-        df_trend = df_trend[df_trend["spoiler_position"] > 0].copy()
-        df_trend["pos_lin"] = df_trend["spoiler_position"].astype(float)
+        # Robustness: does any demographic variable improve M2? (LR test)
+        for variable in demo_cols:
+            m2_variable = utils.lmm_utils.run_lmm(
+                df=df_combined, formula=f"{m2_formula} + C({variable})",
+                groups_col=c.PARTICIPANT_ID, convergence_method=OPT, verbose=False
+            )
+            result = utils.helper_utils.lr_test(m2, m2_variable)
+            demographic_tests.append({'outcome': OUTCOME, 'variable': variable, **result})
 
-        m_trend = utils.lmm_utils.run_lmm(
-            df=df_trend,
-            formula=f"{OUTCOME} ~ pos_lin * C(scenario) + spoiler_{OUTCOME}_cb",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
+    demographic_tests = pd.DataFrame(demographic_tests).drop(columns=['label', 'note'])
+    demographic_tests['p_holm'] = demographic_tests.groupby('outcome')['p'].transform(
+        lambda p: multipletests(p, method='holm')[1]
+    )
+    demographic_tests.to_csv(output_dir / 'task3_M2_demographic_covariates.csv', index=False)
+    log.info(f"M2 + demographic variable (LR test):\n{demographic_tests.round(3)}")
 
-        sc_pos = "C(scenario)[T.Positive]"
-        trend_specs = {
-            "trend_negative": {"pos_lin": 1},
-            "trend_positive": {"pos_lin": 1, f"pos_lin:{sc_pos}": 1},
-        }
-        trend_rows = []
-        for name, spec in trend_specs.items():
-            ct = utils.lmm_utils.lmm_contrast(m_trend, spec)
-            trend_rows.append({"outcome": OUTCOME, "contrast": name, **ct})
-            log.info(f"Linear trend [{OUTCOME}/{name}]: "
-                     f"slope={ct['estimate']:.3f}, p={ct['p']:.4g}")
-        pd.DataFrame(trend_rows).to_csv(
-            output_dir / f"stage3b_linear_trend_{OUTCOME}.csv", index=False)
+    # Planned contrasts (Table 3): Holm p where a family exists, else raw p
+    all_contrasts = pd.DataFrame(all_contrasts)
+    all_contrasts['p_report'] = all_contrasts['p_holm'].fillna(all_contrasts['p'])
+    all_contrasts.to_csv(output_dir / 'planned_contrasts.csv', index=False)
+    columns = ['task', 'contrast', 'outcome', 'estimate', 'ci_low', 'ci_high', 'p_report']
+    log.info(f"Planned contrasts:\n{all_contrasts[columns].round(3).to_string(index=False)}")
 
-        # ==================================================================
-        # STAGE 4 — Aggregation rules: AIC/BIC + recency tests
-        # ==================================================================
-        m_additive = utils.lmm_utils.run_lmm(
-            df=df_combined, formula=f"{OUTCOME} ~ mean_{OUTCOME}",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
+    # Physiology (exploratory): non-bikeable - bikeable block per metric (Holm) and correlations
+    # with the ratings; segment_id (presentation slot) absorbs the drift over the session
+    physio_block = []
+    for metric in PHYSIO_METRICS:
+        model = utils.lmm_utils.run_lmm(
+            df=df_combined.dropna(subset=[metric]), formula=f"{metric} ~ C(scenario) + segment_id",
+            groups_col=c.PARTICIPANT_ID, convergence_method=OPT, verbose=False
+        )
+        result = utils.lmm_utils.lmm_contrast(model, {'C(scenario)[T.Positive]': -1})
+        physio_block.append({'metric': metric, **result})
+    physio_block = pd.DataFrame(physio_block)
+    physio_block['p_holm'] = multipletests(physio_block['p'], method='holm')[1]
+    physio_block.to_csv(output_dir / 'task3_physio_block_contrast.csv', index=False)
+    log.info(f"Physio non-bikeable - bikeable block:\n{physio_block.round(3).to_string(index=False)}")
 
-        # Sequential (recency-weighted) model for the competition
-        m_seq = utils.lmm_utils.run_lmm(
-            df=df_combined, formula=f"{OUTCOME} ~ mean_{OUTCOME} + recency_{OUTCOME}",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
+    physio_three_corr = utils.helper_utils.rm_corr_table(
+        df_combined, c.PARTICIPANT_ID, PHYSIO_METRICS, [c.VALENCE, c.AROUSAL], control='segment_id'
+    )
+    physio_three_corr.to_csv(output_dir / 'task3_physio_rating_correlations.csv', index=False)
+    log.info(f"Physio-rating correlations (Task 3):\n{physio_three_corr.round(3).to_string(index=False)}")
 
-        # Unconstrained model — only for the Wald contrasts (b3 - b1, etc.)
-        m_seq_unconstrained = utils.lmm_utils.run_lmm(
-            df=df_combined, formula=f"{OUTCOME} ~ pos1_{OUTCOME} + pos2_{OUTCOME} + pos3_{OUTCOME}",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
+    # ==============================================================================
+    # PHASE 5: AGGREGATION RULES (Task 3)
+    # ==============================================================================
+    log.info("Phase 5: Aggregation rules")
 
-        m_peak_end = utils.lmm_utils.run_lmm(
-            df=df_combined, formula=f"{OUTCOME} ~ {peak} + {neg} + {end}",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-
-        m_min_end = utils.lmm_utils.run_lmm(
-            df=df_combined, formula=f"{OUTCOME} ~ {neg} + {end}",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-
-        # Nakagawa & Schielzeth marginal/conditional R² for the model-comparison table.
-        r2_add = utils.lmm_utils.calculate_r2_lmm(m_additive)
-        r2_seq = utils.lmm_utils.calculate_r2_lmm(m_seq)
-        r2_pe = utils.lmm_utils.calculate_r2_lmm(m_peak_end)
-        r2_me = utils.lmm_utils.calculate_r2_lmm(m_min_end)
-
-        pd.DataFrame({
-            "Outcome": OUTCOME,
-            "Model": ["Additive (mean-value)", "Sequential (recency-weighted)",
-                      "Peak-End (Sym)", "Minimum-End"],
-            "AIC": [m_additive.aic, m_seq.aic, m_peak_end.aic, m_min_end.aic],
-            "BIC": [m_additive.bic, m_seq.bic, m_peak_end.bic, m_min_end.bic],
-            "R2m": [r2_add[0], r2_seq[0], r2_pe[0], r2_me[0]],
-            "R2c": [r2_add[1], r2_seq[1], r2_pe[1], r2_me[1]],
-        }).sort_values("AIC").to_csv(output_dir / f'stage4_model_comparison_{OUTCOME}.csv', index=False)
-
-        # Recency: LR test (additive vs recency) + Wald contrasts between positions.
-        recency_out = pd.DataFrame([
-            utils.helper_functions.lr_test(m_additive, m_seq, label="equal-weights vs recency-weighted"),
-            utils.helper_functions.wald_contrast(m_seq_unconstrained, {f"pos3_{OUTCOME}": 1, f"pos1_{OUTCOME}": -1},
-                                                 "b3 - b1"),
-            utils.helper_functions.wald_contrast(m_seq_unconstrained, {f"pos3_{OUTCOME}": 1, f"pos2_{OUTCOME}": -1},
-                                                 "b3 - b2"),
-            utils.helper_functions.wald_contrast(m_seq_unconstrained, {f"pos2_{OUTCOME}": 1, f"pos1_{OUTCOME}": -1},
-                                                 "b2 - b1"),
-        ])
-        recency_out.to_csv(output_dir / f"recency_tests_{OUTCOME}.csv", index=False)
-        log.info(f"\nRecency tests ({OUTCOME}):\n{recency_out.to_string(index=False)}")
-
-        # ==================================================================
-        # STAGE 4b — LOPO CV with paired comparison
-        # ==================================================================
-        cv_formulas = {
-            "Additive (mean-value)": f"{OUTCOME} ~ mean_{OUTCOME}",
-            "Sequential (positional-value)": f"{OUTCOME} ~ mean_{OUTCOME} + recency_{OUTCOME}",
-            "Peak-End (Sym)": f"{OUTCOME} ~ {peak} + {neg} + {end}",
-            "Minimum-End": f"{OUTCOME} ~ {neg} + {end}",
-        }
-        cv_fold_rmse = {name: {} for name in cv_formulas}
-        for held_out in df_combined[c.PARTICIPANT_ID].unique():
-            train = df_combined[df_combined[c.PARTICIPANT_ID] != held_out]
-            test = df_combined[df_combined[c.PARTICIPANT_ID] == held_out]
-            for name, formula in cv_formulas.items():
-                try:
-                    m_cv = utils.lmm_utils.run_lmm(df=train, formula=formula,
-                                                   groups_col=c.PARTICIPANT_ID,
-                                                   convergence_method=OPT,
-                                                   verbose=False)
-                    resid = test[OUTCOME].to_numpy() - np.asarray(m_cv.predict(exog=test))
-                    cv_fold_rmse[name][held_out] = float(np.sqrt(np.mean(resid ** 2)))
-                except Exception as e:
-                    log.warning(f"CV fold (p={held_out}, {name}) failed: {e}")
-
-        # Keep only participants whose fold converged for ALL models, so the paired
-        # comparison is balanced. Report how many were dropped (and why) for audit.
-        raw_fold_df = pd.DataFrame(cv_fold_rmse)
-        fold_df = raw_fold_df.dropna()
-        n_total, n_kept = len(raw_fold_df), len(fold_df)
-        if n_total != n_kept:
-            dropped_ids = raw_fold_df.index[raw_fold_df.isna().any(axis=1)].tolist()
-            per_model_failures = raw_fold_df.isna().sum().to_dict()
-            log.warning(
-                f"Stage 4b CV [{OUTCOME}]: {n_kept}/{n_total} participants retained; "
-                f"dropped {n_total - n_kept} with a non-converged fold "
-                f"(ids={dropped_ids}); per-model failures: {per_model_failures}")
-        else:
-            log.info(f"Stage 4b CV [{OUTCOME}]: all {n_total} participant folds converged "
-                     f"(0 dropped).")
-
-        summary = fold_df.mean().sort_values().rename("mean_fold_RMSE").to_frame()
-        best = summary.index[0]
-        rows = []
-        for other in [m for m in fold_df.columns if m != best]:
-            diff = fold_df[other] - fold_df[best]
-            W, p = stats.wilcoxon(diff)
-            rows.append({"best": best, "vs": other,
-                         "median_RMSE_diff": float(diff.median()),
-                         "W": float(W), "p_raw": float(p)})
-        pairs = pd.DataFrame(rows)
-        pairs["p_holm"] = multipletests(pairs["p_raw"], method="holm")[1]
-        log.info(f"\nStage 4b paired CV ({OUTCOME}):\n{summary.to_string()}\n{pairs.to_string(index=False)}")
-        summary.to_csv(output_dir / f"stage4b_cv_summary_{OUTCOME}.csv")
-        pairs.to_csv(output_dir / f"stage4b_cv_paired_tests_{OUTCOME}.csv", index=False)
-
-        # ==================================================================
-        # STAGE 5 — Covariate robustness
-        # ==================================================================
-        base_formula = f"{OUTCOME} ~ C(spoiler_position) * C(scenario) + spoiler_{OUTCOME}_cb"
-        cov_rows = []
-        for cov in covariates:
-            if cov not in df_combined.columns:
-                continue
-            sub = df_combined.dropna(subset=[cov])
-            if sub[cov].nunique() < 2:
-                log.warning(f"{cov}: <2 levels — skipping.")
-                continue
-            m_ref = (m_inter if len(sub) == len(df_combined)
-                     else utils.lmm_utils.run_lmm(df=sub, formula=base_formula,
-                                                  groups_col=c.PARTICIPANT_ID,
-                                                  convergence_method=OPT))
-            m_cov = utils.lmm_utils.run_lmm(
-                df=sub, formula=f"{base_formula} + C({cov})",
-                groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-            res = utils.helper_functions.lr_test(m_ref, m_cov, label=cov)
-            if res["note"]:
-                log.error(f"Stage 5 ({OUTCOME}, {cov}): {res['note']}")
-            cov_rows.append({"outcome": OUTCOME, "covariate": cov, **res})
-        if cov_rows:
-            cov_df = pd.DataFrame(cov_rows)
-            valid = cov_df["p"].notna()
-            cov_df.loc[valid, "p_holm"] = multipletests(cov_df.loc[valid, "p"], method='holm')[1]
-            log.info(f"\nStage 5 covariates ({OUTCOME}):\n{cov_df.to_string(index=False)}")
-            cov_df.to_csv(output_dir / f'stage5_covariates_{OUTCOME}.csv', index=False)
-
-    pd.DataFrame(all_contrasts).to_csv(output_dir / "all_planned_contrasts.csv", index=False)
-
-    # ==========================================================================
-    # PHYSIOLOGY (exploratory): (1) does physio track affect? -> correlations;
-    # (2) does physio carry the sequence effect? -> position LMMs. Filtered set
-    # (PHYSIO_EXCLUDE); correlations within-participant standardized, LMMs raw scale.
-    # ==========================================================================
-    log.info("\n--- Physiology (exploratory) ---")
-
-    df1_ph = df1[~df1[c.PARTICIPANT_ID].isin(PHYSIO_EXCLUDE)].copy()
-    df_two_ph = df_two[~df_two[c.PARTICIPANT_ID].isin(PHYSIO_EXCLUDE)].copy()
-    df_pos_ph = df_positive[~df_positive[c.PARTICIPANT_ID].isin(PHYSIO_EXCLUDE)].copy()
-    df_neg_ph = df_negative[~df_negative[c.PARTICIPANT_ID].isin(PHYSIO_EXCLUDE)].copy()
-    df_comb_ph = df_combined[~df_combined[c.PARTICIPANT_ID].isin(PHYSIO_EXCLUDE)].copy()
-
-    def _within_standardize(d):
-        """log1p the skewed SCR amplitude, then within-participant z-score all metrics."""
-        d = d.copy()
-        d["SCR_Peaks_Amplitude_Mean"] = np.log1p(d["SCR_Peaks_Amplitude_Mean"].clip(lower=0))
-        for col in PHYSIO_METRICS:
-            d[col] = d.groupby(c.PARTICIPANT_ID)[col].transform(
-                lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else s - s.mean())
-        return d
-
-    # --- (1) Does physio track the affect ratings? (within-participant standardized) ---
-    corr_rows = []
-    for level, d_raw in [("clips", df1_ph), ("Task2", df_two_ph),
-                         ("Task3_pos", df_pos_ph), ("Task3_neg", df_neg_ph)]:
-        d = _within_standardize(d_raw)
-        for metric in PHYSIO_METRICS:
-            for affect in ["valence", "arousal"]:
-                sub = d.dropna(subset=[metric, affect])
-                if len(sub) < 10:
-                    continue
-                rho, p = stats.spearmanr(sub[metric], sub[affect])
-                corr_rows.append({"level": level, "metric": metric, "affect": affect,
-                                  "n": len(sub), "rho": round(rho, 3), "p_raw": round(p, 4)})
-    corr_df = pd.DataFrame(corr_rows)
-    corr_df["family"] = np.where(corr_df["level"] == "clips",
-                                 "clip_tracking", "sequence_tracking")
-    corr_df["p_holm"] = np.nan
-    for fam, idx in corr_df.groupby("family").groups.items():
-        corr_df.loc[idx, "p_holm"] = multipletests(
-            corr_df.loc[idx, "p_raw"], method="holm")[1]
-
-    # Report the two families separately in the log for auditability
-    for fam in ["clip_tracking", "sequence_tracking"]:
-        sub = corr_df[corr_df["family"] == fam]
-        log.info(f"\nPhysio–affect tracking [{fam}, {len(sub)} tests]:\n"
-                 f"{sub.to_string(index=False)}")
-    corr_df.to_csv(output_dir / "physio_affect_tracking.csv", index=False)
-
-    # --- (2) Does physio carry the sequence effect? (raw scale; log1p SCR only) ---
-    df_comb_ph["SCR_Peaks_Amplitude_Mean"] = np.log1p(
-        df_comb_ph["SCR_Peaks_Amplitude_Mean"].clip(lower=0))
-    physio_rows = []
-    for PHYS in PHYSIO_METRICS:
-        sub3 = df_comb_ph.dropna(subset=[PHYS])
-        if len(sub3) < 30 or sub3[c.PARTICIPANT_ID].nunique() < 5:
-            log.warning(f"Skipping physio LMM for {PHYS} (N={len(sub3)}).")
-            continue
-        m_main = utils.lmm_utils.run_lmm(
-            df=sub3, formula=f"{PHYS} ~ C(spoiler_position) + C(scenario)",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-        m_inter = utils.lmm_utils.run_lmm(
-            df=sub3, formula=f"{PHYS} ~ C(spoiler_position) * C(scenario)",
-            groups_col=c.PARTICIPANT_ID, convergence_method=OPT)
-        rq = utils.helper_functions.lr_test(m_main, m_inter, label=f"physio omnibus ({PHYS})")
-        physio_rows.append({"metric": PHYS, "n_obs": len(sub3),
-                            "omnibus_lrt": rq["lrt"], "omnibus_df": rq["df"],
-                            "omnibus_p": rq["p"]})
-    pd.DataFrame(physio_rows).to_csv(output_dir / "physio_sequence_lmm.csv", index=False)
-    log.info(f"\nPhysio sequence LMM omnibus:\n{pd.DataFrame(physio_rows).to_string(index=False)}")
-
-    # --- Physio across spoiler positions (visual: flat = no sequence effect) ---
-    import matplotlib.pyplot as plt
-    plot_metrics = ["SCL_Delta", "PPG_Rate_Mean"]  # arousal-relevant; EDA + cardiac
-    order_map = {
-        "Negative": c.TRIAL_4_PLOT_ORDER,  # NB-baseline + B spoiler
-        "Positive": c.TRIAL_3_PLOT_ORDER,  # B-baseline + NB spoiler
+    # Predictors from the Task 1 clip means of the three segments
+    rules = {
+        'Additive': 'a_mean',
+        'Sequential': 'a_mean + a_recency',
+        'Peak-End': 'a_best + a_worst + a_end',
+        'Minimum-End': 'a_worst + a_end',
     }
-    fig, axes = plt.subplots(len(plot_metrics), 2, figsize=(12, 4 * len(plot_metrics)),
-                             sharex="col")
-    for i, metric in enumerate(plot_metrics):
-        for j, (block, dfb) in enumerate([("Negative", df_neg_ph), ("Positive", df_pos_ph)]):
-            ax = axes[i, j]
-            g = (dfb.dropna(subset=[metric])
-                 .groupby("sequence_type")[metric].agg(["mean", "sem"])
-                 .reindex(order_map[block]))
-            ax.errorbar(range(len(g)), g["mean"], yerr=g["sem"],
-                        marker="o", capsize=4, color="#444")
-            ax.set_xticks(range(len(g)))
-            ax.set_xticklabels(g.index, rotation=25, ha="right", fontsize=8)
-            ax.set_title(f"{metric} — {block} block", fontsize=10)
-            ax.axhline(g["mean"].mean(), color="gray", ls="--", alpha=0.4)
-            if j == 0:
-                ax.set_ylabel(metric)
-    fig.suptitle("Physiological metrics across spoiler positions "
-                 "(flat profiles indicate no experienced sequence effect)")
-    fig.tight_layout()
-    fig.savefig(output_dir / "physio_position_trends.png", dpi=150)
-    plt.close(fig)
+    rule_fits, recency_tests = [], []
+
+    for outcome in [c.VALENCE, c.AROUSAL]:
+        segments = df_combined[[f'pos{k}_{outcome}' for k in (1, 2, 3)]].to_numpy()
+        low, high = segments.min(axis=1), segments.max(axis=1)
+        is_valence = outcome == c.VALENCE
+        # Worst moment = lowest valence or highest arousal
+        df_rules = df_combined.assign(
+            a_mean=segments.mean(axis=1),
+            a_recency=segments[:, 2] - segments[:, 0],
+            a_end=segments[:, 2],
+            a_best=high if is_valence else low,
+            a_worst=low if is_valence else high,
+        )
+        fits = {
+            rule: utils.lmm_utils.run_lmm(
+                df=df_rules, formula=f"{outcome} ~ {terms}",
+                groups_col=c.PARTICIPANT_ID, convergence_method=OPT, verbose=False
+            )
+            for rule, terms in rules.items()
+        }
+
+        # Table 4: AIC, marginal and conditional R2
+        for rule, model in fits.items():
+            r2m, r2c = utils.lmm_utils.calculate_r2_lmm(model)
+            rule_fits.append({
+                'outcome': outcome, 'rule': rule, 'AIC': model.aic, 'R2m': r2m, 'R2c': r2c
+            })
+
+        # Recency term: LR test Sequential vs Additive
+        sequential = fits['Sequential']
+        lr = utils.helper_utils.lr_test(fits['Additive'], sequential)
+        recency = utils.lmm_utils.lmm_contrast(sequential, {'a_recency': 1})
+        recency_tests.append({
+            'outcome': outcome, 'term': 'recency', **recency,
+            'lr_chi2': lr['lrt'], 'lr_df': lr['df'], 'lr_p': lr['p']
+        })
+        # Implied segment weights: w_k = b_mean / 3 + (k - 2) * b_recency
+        for k in (1, 2, 3):
+            weight = utils.lmm_utils.lmm_contrast(sequential, {'a_mean': 1 / 3, 'a_recency': k - 2})
+            recency_tests.append({'outcome': outcome, 'term': f'weight_{k}', **weight})
+        w1, w3 = recency_tests[-3]['estimate'], recency_tests[-1]['estimate']
+        recency_tests.append({'outcome': outcome, 'term': 'weight_3 / weight_1', 'estimate': w3 / w1})
+
+    rule_fits = pd.DataFrame(rule_fits)
+    rule_fits.to_csv(output_dir / 'task3_aggregation_rules.csv', index=False)
+    log.info(f"Aggregation rules:\n{rule_fits.round(3).to_string(index=False)}")
+
+    recency_tests = pd.DataFrame(recency_tests)
+    recency_tests.to_csv(output_dir / 'task3_recency_weights.csv', index=False)
+    log.info(f"Recency term and segment weights:\n{recency_tests.round(3).to_string(index=False)}")
 
 
 if __name__ == "__main__":
