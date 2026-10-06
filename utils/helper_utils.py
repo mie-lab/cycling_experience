@@ -3,10 +3,9 @@ import pandas as pd
 import re
 from scipy.stats import pearsonr, spearmanr, friedmanchisquare, page_trend_test
 import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy import stats
 import constants as c
-import utils.processing_utils
+import utils.process_utils
 from scipy.stats import wilcoxon
 
 
@@ -69,40 +68,34 @@ def trial_dict_to_df(trial_dict):
     return pd.DataFrame(records)
 
 
+def _boot_ci(x, y, corr, n_boot=5000, seed=42):
+    """95% percentile bootstrap CI of a correlation, resampling clips."""
+    idx = np.random.default_rng(seed).integers(0, len(x), (n_boot, len(x)))
+    return np.nanpercentile([corr(x[i], y[i])[0] for i in idx], [2.5, 97.5])
+
+
 def get_video_level_metrics(df, lab_sample, prediction, online_sample):
-    """
-    Agreement of lab clip means vs k-NN prediction and/or online survey.
-    Prediction block runs only if a prediction column is given (valence has
-    one, arousal does not). Returns a dict of metrics.
-    """
+    """Agreement of lab clip means with the k-NN prediction and with the online survey."""
     out = {}
-
-    # lab vs prediction (RMSE/MAE matter here: the selection band was in RMSE units)
-    if prediction is not None:
-        d = df.dropna(subset=[lab_sample, prediction])
-        y_true, y_pred = d[lab_sample], d[prediction]
-        mae = mean_absolute_error(y_true, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-        pr, pr_p = pearsonr(y_true, y_pred)
-        sr, sr_p = spearmanr(y_true, y_pred)
-        print(f"[{lab_sample}] vs prediction (n={len(d)}): "
-              f"MAE={mae:.3f}, RMSE={rmse:.3f}, "
-              f"Pearson r={pr:.3f} (p={pr_p:.3g}), Spearman ρ={sr:.3f} (p={sr_p:.3g})")
-        out.update(n_pred=len(d), mae=mae, rmse=rmse,
-                   pearson_pred=pr, pearson_pred_p=pr_p,
-                   spearman_pred=sr, spearman_pred_p=sr_p)
-
-    # lab vs online (Spearman is the headline: the claim is about clip ordering)
-    d = df.dropna(subset=[lab_sample, online_sample])
-    pr_on, pr_on_p = pearsonr(d[lab_sample].values, d[online_sample].values)
-    sr_on, sr_on_p = spearmanr(d[lab_sample].values, d[online_sample].values)
-    print(f"[{lab_sample}] vs online (n={len(d)}): "
-          f"Pearson r={pr_on:.3f} (p={pr_on_p:.3g}), Spearman ρ={sr_on:.3f} (p={sr_on_p:.3g})")
-    out.update(n_online=len(d),
-               pearson_online=pr_on, pearson_online_p=pr_on_p,
-               spearman_online=sr_on, spearman_online_p=sr_on_p)
-
+    for ref, col in (("pred", prediction), ("online", online_sample)):
+        d = df.dropna(subset=[lab_sample, col])
+        x, y = d[lab_sample].to_numpy(), d[col].to_numpy()
+        diff = x - y
+        res = {"n": len(d), "bias": diff.mean(), "rmse": np.sqrt((diff ** 2).mean()), "mae": np.abs(diff).mean()}
+        for name, corr in (("pearson", pearsonr), ("spearman", spearmanr)):
+            res[name] = corr(x, y)[0]
+            res[f"{name}_ci_low"], res[f"{name}_ci_high"] = _boot_ci(x, y, corr)
+        out.update({f"{k}_{ref}": v for k, v in res.items()})
     return out
+
+
+def get_clip_types(lab_seq_df):
+    """Map clip id to 'B' or 'NB', parsed from the file names in the lab sequence file."""
+    files = lab_seq_df.drop(columns='participant').stack()
+    parsed = files.str.extract(r'video_(\d+)_(NB|B)').dropna().drop_duplicates()
+    return parsed.set_index(parsed[0].astype(int))[1]
+
+
 def check_variance_homogeneity(df, group_col, target_col, center='median', alpha=0.05, print_msg=True):
     """Levene's test for equal variances of `target_col` across `group_col`."""
     groups = [g[target_col].dropna().values for _, g in df.groupby(group_col)]
@@ -166,12 +159,10 @@ def add_sequence_info(
     df['B_counts'] = df['sequence_list'].apply(lambda l: Counter(l)['B'])
     df['NB_counts'] = df['sequence_list'].apply(lambda l: Counter(l)['NB'])
 
-    if scenario == 'NB':
-        # Add NB position column (1-based index, 0 if no NB in sequence)
-        df['NB_position'] = df['sequence_list'].apply(lambda x: 0 if 'NB' not in x else x.index('NB') + 1)
-    else:
-        # Add B position column (1-based index, 0 if no B in sequence)
-        df['B_position'] = df['sequence_list'].apply(lambda x: 0 if 'B' not in x else x.index('B') + 1)
+    # Position of the off-type segment (`scenario` = its type): 1-3, or 0 for the baseline
+    df['off_type_position'] = df['sequence_list'].apply(
+        lambda seq: seq.index(scenario) + 1 if scenario in seq else 0
+    )
 
     # Calculate mean, peak, and end VALENCE
     pos_valence_cols = [f"pos{i + 1}_{valence_col}" for i in range(max_conds)]
@@ -204,29 +195,63 @@ def load_and_process_trial_data(
     trial_dict = get_trial_dict(study_results, experiment_setup, trial_params['trial_label'], c.VIDEO_COUNTS)
     df = trial_dict_to_df(trial_dict)
 
-    df['video_order'] = (df[c.VIDEO_ID_COL].str.extract(r'_(\d+)\.', expand=False).astype(int))
     df[c.VIDEO_ID_COL] = df[c.VIDEO_ID_COL].str.replace(r'\.mp4$', '', regex=True)
-    df = df.sort_values([c.PARTICIPANT_ID, 'video_order'])
+    df = df.sort_values([c.PARTICIPANT_ID, c.VIDEO_ID_COL])
 
-    df = utils.processing_utils.add_valence_arousal(df, 'rating')
+    df = utils.process_utils.add_valence_arousal(df, 'rating')
     df = add_sequence_info(df, trial_params['video_mapping'], video_sequences, video_level_scores, scenario)
 
     return df
 
 
+def repeated_measures_corr(df, subject_col, x, y, control=None):
+    """
+    Repeated-measures correlation (Bakdash & Marusich, 2017): Pearson r of the
+    within-subject centred x and y, with df = N - subjects - 1 and a Fisher-z 95% CI.
+    `control` (e.g. presentation slot) is partialled out of both (one df less).
+    """
+    cols = [x, y] + ([control] if control else [])
+    d = df[[subject_col] + cols].dropna()
+    centred = d[cols] - d.groupby(subject_col)[cols].transform('mean')
+    if control:
+        z = centred[control]
+        centred = centred[[x, y]].apply(lambda v: v - (v @ z) / (z @ z) * z)
+    r = centred[x].corr(centred[y])
+    dof = len(d) - d[subject_col].nunique() - 1 - bool(control)
+    p = 2 * stats.t.sf(abs(r) * np.sqrt(dof / (1 - r ** 2)), dof)
+    z, se = np.arctanh(r), 1 / np.sqrt(dof - 1)
+    return {'n': len(d), 'df': dof, 'r': r, 'p': p,
+            'ci_low': np.tanh(z - 1.96 * se), 'ci_high': np.tanh(z + 1.96 * se)}
+
+
+def rm_corr_table(df, subject_col, metrics, outcomes, control=None):
+    """Repeated-measures r with 95% CI for every metric x outcome pair (descriptive, no p)."""
+    rows = []
+    for metric in metrics:
+        for outcome in outcomes:
+            result = repeated_measures_corr(df, subject_col, metric, outcome, control)
+            rows.append({'metric': metric, 'outcome': outcome,
+                         **{k: result[k] for k in ('n', 'r', 'ci_low', 'ci_high')}})
+    return pd.DataFrame(rows)
+
+
 def wilcoxon_pair(df, subject_col, condition_col, value_col, cond_a, cond_b):
     """
-    Paired Wilcoxon signed-rank between two conditions (e.g. order test
-    NB->B vs B->NB) on a within-subject outcome (ranking or valence).
-    Pairs subjects who have both conditions.
+    Paired Wilcoxon signed-rank test of cond_a vs cond_b, plus the mean
+    paired difference (a - b) with its 95% t-interval. Zero differences
+    are dropped by the test, so n_nonzero is the test's sample size.
     """
     wide = df.pivot_table(index=subject_col, columns=condition_col, values=value_col)
     wide = wide[[cond_a, cond_b]].dropna()
+    diff = wide[cond_a] - wide[cond_b]
+    half_width = stats.t.ppf(0.975, len(diff) - 1) * diff.sem()
     stat, p = wilcoxon(wide[cond_a], wide[cond_b])
     return {
-        "comparison": f"{cond_a} vs {cond_b}", "outcome": value_col,
-        "n_pairs": len(wide), "median_a": wide[cond_a].median(),
-        "median_b": wide[cond_b].median(), "W": float(stat), "p": float(p),
+        "comparison": f"{cond_a} - {cond_b}", "outcome": value_col,
+        "n_pairs": len(wide), "n_nonzero": int((diff != 0).sum()),
+        "mean_a": wide[cond_a].mean(), "mean_b": wide[cond_b].mean(),
+        "mean_diff": diff.mean(), "ci_low": diff.mean() - half_width,
+        "ci_high": diff.mean() + half_width, "W": float(stat), "p": float(p),
     }
 
 
@@ -312,7 +337,7 @@ def page_trend_ranking(df, subject_col, condition_col, value_col, predicted_orde
     res = page_trend_test(wide.to_numpy(), ranked=False, method="auto")
 
     mean_rank = df.groupby(condition_col)[value_col].mean()
-    mean_rank_by_condition = {cond: float(mean_rank[cond]) for cond in predicted_order}
+    mean_rank_by_condition = {cond: round(float(mean_rank[cond]), 3) for cond in predicted_order}
 
     return {
         "L": float(res.statistic),
