@@ -9,9 +9,9 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import MinMaxScaler
 import sys
 import constants as c
-import utils.helper_functions
+import utils.helper_utils
 import seaborn as sns
-import utils.processing_utils
+import utils.process_utils
 import logging
 from pathlib import Path
 import pandas as pd
@@ -455,11 +455,11 @@ def main():
     seq_df = pd.read_csv(sequence_file, parse_dates=['seq_start', 'seq_end'])
     video_ground_truth_features = pd.read_csv(ground_truth_file)
 
-    survey_results_df = utils.processing_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
-    survey_results_df = utils.processing_utils.filter_results(survey_results_df)
-    survey_results_df = utils.processing_utils.add_valence_arousal(survey_results_df)
+    survey_results_df = utils.process_utils.transform_to_long_df(survey_df, seq_df, id_col=c.PARTICIPANT_ID)
+    survey_results_df = utils.process_utils.filter_results(survey_results_df)
+    survey_results_df = utils.process_utils.add_valence_arousal(survey_results_df)
 
-    video_level_scores = utils.processing_utils.calculate_video_level_scores(survey_results_df)
+    video_level_scores = utils.process_utils.calc_video_level_scores(survey_results_df)
 
     #feature_cols = ['bike_infra_type', 'slope', 'car_lanes_total_count', 'traffic_volume',
     #                'motorized_traffic_speed_kmh', 'average_building_share', 'average_greenery_share',
@@ -481,7 +481,7 @@ def main():
     # ==============================================================================
     log.info("Phase 3: Selecting features from top PF/NF tag correlates")
 
-    video_level_scores = utils.processing_utils.add_factor_counts_to_scores(
+    video_level_scores = utils.process_utils.add_factor_counts_to_scores(
         scores_df=video_level_scores,
         survey_df=survey_results_df,
         label_cols=c.LABEL_COLS,
