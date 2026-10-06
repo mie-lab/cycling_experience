@@ -46,7 +46,7 @@ def transform_to_long_df(
 
     pos_to_idx = {
         int(m.group(2)): d.columns.get_indexer([f"{q}{m.group(2)}" for q in questions])
-        for col in d.columns if (m := re.fullmatch(f"({c.OE}|{c.AG}|{c.PF}|{c.NF}|{c.F})(\d+)", col))
+        for col in d.columns if (m := re.fullmatch(fr"({c.OE}|{c.AG}|{c.PF}|{c.NF}|{c.F})(\d+)", col))
     }
 
     rows = []
@@ -101,7 +101,7 @@ def filter_results(
     return df.loc[mask]
 
 
-def aggregate_by_characteristics(
+def agg_by_chars(
         df: pd.DataFrame,
         gender: bool = False,
         age: bool = False,
@@ -115,10 +115,11 @@ def aggregate_by_characteristics(
     """
     Collapse demographic/cycling categories into coarser groups (one boolean toggle per
     field); `is_swiss` adds a binary residence column. Exact groupings are in the lookup
-    tables below.
+    tables below. Note: `gender`, `cycling_environment` and `cycling_frequency` also DROP
+    rows (non-Male/Female, 'Other'); the number of participants removed is logged.
     """
     df = df.copy()
-    mask = pd.Series(True, index=df.index)
+    filters = {}  # column -> keep-mask, applied (and logged) after recoding
 
     # if upward aggregation needed to gain some significance power
     if age:
@@ -131,13 +132,13 @@ def aggregate_by_characteristics(
         df[c.AGE] = df[c.AGE].replace(age_lookup)
 
     if gender:
-        mask &= df[c.GENDER].isin(['Male', 'Female'])
+        filters[c.GENDER] = df[c.GENDER].isin(['Male', 'Female'])
 
     if cycling_environment:
-        mask &= df[c.CYCL_ENV] != 'Other'
+        filters[c.CYCL_ENV] = df[c.CYCL_ENV] != 'Other'
 
     if cycling_frequency:
-        mask &= df[c.CYCL_FREQ] != 'Other'
+        filters[c.CYCL_FREQ] = df[c.CYCL_FREQ] != 'Other'
         frequency_lookup = {
             "Never": "Infrequent",
             "Less than once a month": "Infrequent",
@@ -178,6 +179,18 @@ def aggregate_by_characteristics(
             'Extremely familiar': 'Familiar'
         }
         df[c.F] = df[c.F].replace(familiarity_lookup)
+
+    # Participant ids live in a column (long online data) or in the index (wide lab data)
+    ids = df[c.PARTICIPANT_ID] if c.PARTICIPANT_ID in df.columns else df.index.to_series(index=df.index)
+    mask = pd.Series(True, index=df.index)
+    for col, keep in filters.items():
+        if (~keep).any():
+            dropped = ids[~keep].groupby(df.loc[~keep, col], dropna=False).nunique().to_dict()
+            log.info(f"agg_by_chars: '{col}' filter drops {ids[~keep].nunique()} participants "
+                     f"({(~keep).sum()} rows); dropped values: {dropped}")
+        mask &= keep
+    log.info(f"agg_by_chars: kept {ids[mask].nunique()}/{ids.nunique()} participants "
+             f"({mask.sum()}/{len(df)} rows)")
 
     df = df.loc[mask]
 
@@ -256,16 +269,23 @@ def assign_affective_state(df):
 def add_valence_arousal(
         df: pd.DataFrame,
         ag_col: str = c.AG,
-        grid: int = 10
+        grid: int = 10,
+        equal_interval: bool = False
 ) -> pd.DataFrame:
-    """Map Affect-Grid cell numbers in `ag_col` to continuous valence/arousal in [-1, 1]."""
+    """
+    Map Affect-Grid cell numbers in `ag_col` to continuous valence/arousal in [-1, 1].
+    Default coding drops the grid midpoint (steps of 0.2, with a 0.4 step across zero);
+    `equal_interval=True` spaces all cells evenly (steps of 2/(grid-1)) for sensitivity checks.
+    """
     df = df.copy()
     ag = pd.to_numeric(df[ag_col], errors="coerce")
     idx0 = ag - 1
     col = (idx0 % grid).astype("Int64")
     row = (idx0 // grid).astype("Int64")
-    vals = np.linspace(-1.0, 1.0, grid + 1)
-    VALENCE_LUT = np.delete(vals, grid // 2)
+    if equal_interval:
+        VALENCE_LUT = np.linspace(-1.0, 1.0, grid)
+    else:
+        VALENCE_LUT = np.delete(np.linspace(-1.0, 1.0, grid + 1), grid // 2)
     AROUSAL_LUT = VALENCE_LUT[::-1]
 
     valence = np.full(len(df), np.nan, float)
@@ -283,7 +303,7 @@ def add_valence_arousal(
     return df
 
 
-def calculate_video_level_scores(
+def calc_video_level_scores(
         long_df: pd.DataFrame,
         output_path: Optional[Union[str, Path]] = None,
         lab_bool: bool = False
@@ -567,8 +587,8 @@ def calculate_video_level_scores(
 
             results.append([
                 video_id,
-                round(valence_mean, 2),
-                round(arousal_mean, 2)])
+                round(valence_mean, 3),
+                round(arousal_mean, 3)])
             cols = [
                 c.VIDEO_ID_COL,
                 "valence",
@@ -600,7 +620,7 @@ def calculate_video_level_scores_by_subgroup(
         if n_participants < min_participants:
             continue
 
-        video_scores = calculate_video_level_scores(df_sub)
+        video_scores = calc_video_level_scores(df_sub)
 
         video_scores = add_factor_counts_to_scores(
             scores_df=video_scores,
@@ -888,10 +908,10 @@ def compute_video_reliability(long_df, n_splits=10):
         split_B = participants[split_point:]
 
         # Compute metrics for each video in each split
-        metrics_A = calculate_video_level_scores(
+        metrics_A = calc_video_level_scores(
             long_df[long_df['participant_id'].isin(split_A)]
         )
-        metrics_B = calculate_video_level_scores(
+        metrics_B = calc_video_level_scores(
             long_df[long_df['participant_id'].isin(split_B)]
         )
 
@@ -1431,51 +1451,25 @@ def prepare_categorical_predictors(df: pd.DataFrame, ordinal_map: dict) -> pd.Da
     return df_out
 
 
-def _offtype_clip_id(row, pos_col="spoiler_position"):
-    """Off-type (spoiler) clip id, or 'baseline' for homogeneous routes (spoiler_position 0)."""
-    try:
-        pos = int(row[pos_col])
-    except (TypeError, ValueError):
-        return "baseline"
-    if pos == 0:
-        return "baseline"
-    vid = row.get(f"pos{pos}_video_id")
-    if pd.isna(vid):
-        return "baseline"
-    return f"clip_{int(vid)}"
-
-
 def prepare_combined_scenario_df(
         df_positive: pd.DataFrame,
         df_negative: pd.DataFrame
 ) -> pd.DataFrame:
-    """
-    Stack the positive and negative blocks into one modelling frame, adding `scenario`,
-    `spoiler_position`, `NB_count`, and `spoiler_clip`.
-    """
-    # Create copies to avoid modifying original dataframes
-    df_pos = df_positive.copy()
-    df_neg = df_negative.copy()
+    """Stack the Positive and Negative blocks into one modelling frame with a `scenario` column."""
+    return pd.concat(
+        [df_positive.assign(scenario='Positive'), df_negative.assign(scenario='Negative')],
+        ignore_index=True
+    )
 
-    # Standardize column names for combining
-    df_pos['scenario'] = 'Positive'
-    df_pos['spoiler_position'] = df_pos['NB_position']
 
-    df_neg['scenario'] = 'Negative'
-    df_neg['spoiler_position'] = df_neg['B_position']
-
-    # Combine and set appropriate data types for modeling
-    df_combined = pd.concat([df_pos, df_neg])
-    df_combined['scenario'] = pd.Categorical(df_combined['scenario'])
-    df_combined['spoiler_position'] = pd.Categorical(df_combined['spoiler_position'])
-
-    # Add the quantity of spoilers in the sequence. Counting B would result in the same but inverse reults.
-    df_combined['NB_count'] = df_combined['sequence_list'].apply(lambda seq: seq.count('NB'))
-
-    # --- Off-type (spoiler) clip id for the crossed random effect (Stage 4) ---
-    df_combined["spoiler_clip"] = df_combined.apply(_offtype_clip_id, axis=1)
-    df_combined["spoiler_clip"] = df_combined["spoiler_clip"].astype("category")
-
-    df_combined = df_combined.reset_index(drop=True)
-
-    return df_combined
+def add_off_type_covariate(df, outcome):
+    """Add the off-type clip's Task 1 mean, centred within scenario (0 for baselines)."""
+    position = df['off_type_position']
+    value = pd.Series(np.select(
+        [position == k for k in (1, 2, 3)],
+        [df[f'pos{k}_{outcome}'] for k in (1, 2, 3)],
+        default=np.nan
+    ), index=df.index)
+    name = f'off_type_{outcome}_cb'
+    df[name] = (value - value.groupby(df['scenario']).transform('mean')).fillna(0.0)
+    return name
