@@ -16,15 +16,11 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 
-
 def main():
-    """
-    Main function to run the entire analysis pipeline from start to finish.
-    """
+    """Lab study: stimulus validation (Task 1), two- and three-segment sequences (Tasks 2-3)."""
     # ==============================================================================
     # PHASE 0: SETUP & CONFIGURATION
     # ==============================================================================
-    log.info("Loading configuration...")
     config = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
     config.read("config.ini")
 
@@ -37,7 +33,6 @@ def main():
     lab_setup_file = Path(config['filenames']['lab_experiment_setup_file'])
     physio_file = Path(config["filenames"]["physiological_results_file"])
 
-    # Define and create the output directory.
     output_dir = Path(config['paths']['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -45,46 +40,38 @@ def main():
     PHYSIO_EXCLUDE = {0, 3, 12, 24}  # recording failure (0, 3, 24), medical reason (12)
     # Raw levels: participant random intercepts absorb individual baselines
     PHYSIO_METRICS = ["SCR_Peaks_Amplitude_Mean", "SCL_Mean", "PPG_Rate_Mean", "HRV_RMSSD"]
-    SCR = "SCR_Peaks_Amplitude_Mean"  # skewed: log1p-transformed for the analyses
+    SCR = "SCR_Peaks_Amplitude_Mean"  # skewed: log1p-transformed
 
     # ==============================================================================
     # PHASE 1: LOAD DATA
     # ==============================================================================
+    log.info("Phase 1: Load data")
 
-    log.info("Phase 1.1: Load online survey (validation reference)")
-
+    # Online survey: reference ratings for the validated clips
     survey_df = pd.read_excel(online_results_file).set_index(c.PARTICIPANT_ID)
     online_seq_df = pd.read_csv(online_sequence_file, parse_dates=['seq_start', 'seq_end'])
 
-    survey_results_df = utils.process_utils.transform_to_long_df(survey_df, online_seq_df, id_col=c.PARTICIPANT_ID)
+    survey_results_df = utils.process_utils.transform_to_long_df(
+        survey_df, online_seq_df, id_col=c.PARTICIPANT_ID
+    )
     survey_results_df = utils.process_utils.filter_results(survey_results_df)
     survey_results_df = utils.process_utils.add_valence_arousal(survey_results_df)
     survey_results_df = utils.process_utils.agg_by_chars(
-        survey_results_df,
-        age=True,
-        gender=True,
-        cycling_frequency=True,
-        cycling_confidence=True,
-        cycling_purpose=True,
-        cycling_environment=True,
-        familiarity=True,
-        is_swiss=True
+        survey_results_df, age=True, gender=True, cycling_frequency=True,
+        cycling_confidence=True, cycling_purpose=True, cycling_environment=True,
+        familiarity=True, is_swiss=True
     )
 
-    online_video_level_scores = utils.process_utils.calc_video_level_scores(survey_results_df, lab_bool=True)
-    online_video_level_scores = online_video_level_scores.rename(
-        columns={
-            c.VALENCE: 'valence_online',
-            c.AROUSAL: 'arousal_online'
-        }
+    online_video_level_scores = (
+        utils.process_utils.calc_video_level_scores(survey_results_df, lab_bool=True)
+        .rename(columns={c.VALENCE: 'valence_online', c.AROUSAL: 'arousal_online'})
     )
-    n_online_ratings = survey_results_df.groupby(c.VIDEO_ID_COL).size()
-    log.info(f"Online survey: {survey_results_df[c.PARTICIPANT_ID].nunique()} respondents, "
+    n_ratings = survey_results_df.groupby(c.VIDEO_ID_COL).size()
+    log.info(f"Online: {survey_results_df[c.PARTICIPANT_ID].nunique()} respondents, "
              f"{len(online_video_level_scores)} clips, "
-             f"{n_online_ratings.min()}-{n_online_ratings.max()} ratings per clip")
+             f"{n_ratings.min()}-{n_ratings.max()} ratings/clip")
 
-    log.info("Phase 1.2: Load lab study (ratings + demographics)")
-
+    # Lab study: ratings, rankings and demographics
     lab_results_df = pd.read_excel(lab_results_file).set_index(c.PARTICIPANT_ID, drop=True)
     lab_results_df = utils.process_utils.agg_by_chars(
         lab_results_df,
@@ -101,27 +88,23 @@ def main():
         .drop(columns=demo_cols + [c.START, c.END])
         .apply(pd.to_numeric, errors='coerce')
     )
-    log.info(f"Lab study: {len(lab_results_df)} participants, {lab_results_df.shape[1]} rating/ranking columns, "
-             f"{int(lab_results_df.isna().sum().sum())} missing or non-numeric values")
-
+    log.info(f"Lab: {len(lab_results_df)} participants, "
+             f"{int(lab_results_df.isna().sum().sum())} missing values")
     for col in demo_cols:
-        shares = demographics_df[col].value_counts(normalize=True, dropna=False).mul(100).round(1)
-        log.info(f"  {col} (%): {shares.to_dict()}")
-
-    log.info("Phase 1.3: Load sequence, setup, prediction, and physiology files")
+        shares = demographics_df[col].value_counts(normalize=True, dropna=False)
+        log.info(f"  {col} (%): {shares.mul(100).round(1).to_dict()}")
 
     lab_seq_df = pd.read_csv(lab_sequence_file)
     experiment_setup = pd.read_csv(lab_setup_file, header=None).set_index(0, drop=True)
     video_score_predictions = pd.read_csv(video_predictions_file)
-
     df_physio = pd.read_csv(physio_file)
 
-    # Physio segment k is mapped to presentation slot k: flag segments whose duration does not fit
+    # Physio segment k = presentation slot k: flag segments whose duration does not fit
     misaligned = utils.physio_utils.check_segment_alignment(df_physio, experiment_setup)
     if not misaligned.empty:
-        log.warning(f"Physio segments not matching their slot:\n{misaligned.to_string(index=False)}")
+        log.warning(f"Misaligned physio segments:\n{misaligned.to_string(index=False)}")
 
-    # Drop excluded participants and misaligned segments; log-transform the skewed SCR
+    # Drop excluded participants and misaligned segments
     misaligned_ids = set(zip(misaligned[c.PARTICIPANT_ID], misaligned['slot']))
     keep = [
         pid not in PHYSIO_EXCLUDE and (pid, slot) not in misaligned_ids
@@ -130,12 +113,15 @@ def main():
     df_physio = df_physio[keep].copy()
     df_physio[SCR] = np.log1p(df_physio[SCR].clip(lower=0))
 
-    phys3 = utils.physio_utils.get_physio_trial_df(df_physio, experiment_setup,
-                                                   c.TRIAL_3_PARAMS["trial_label"], PHYSIO_METRICS)
-    phys4 = utils.physio_utils.get_physio_trial_df(df_physio, experiment_setup,
-                                                   c.TRIAL_4_PARAMS["trial_label"], PHYSIO_METRICS)
-    for label, d in (("bikeable block", phys3), ("non-bikeable block", phys4)):
-        log.info(f"Physio {label}: {len(d)} sequences from {d[c.PARTICIPANT_ID].nunique()} participants")
+    phys3, phys4 = (
+        utils.physio_utils.get_physio_trial_df(
+            df_physio, experiment_setup, params["trial_label"], PHYSIO_METRICS
+        )
+        for params in (c.TRIAL_3_PARAMS, c.TRIAL_4_PARAMS)
+    )
+    for label, d in (("bikeable", phys3), ("non-bikeable", phys4)):
+        log.info(f"Physio {label} block: {len(d)} sequences, "
+                 f"{d[c.PARTICIPANT_ID].nunique()} participants")
 
     # ==============================================================================
     # PHASE 2: STIMULUS VALIDATION (Task 1 single-clip ratings)
@@ -212,19 +198,24 @@ def main():
     log.info(f"Agreement:\n{agreement.round(3)}")
 
     # Physiology per clip (exploratory)
-    phys1 = utils.physio_utils.get_physio_trial_df(df_physio, experiment_setup, c.TRIAL_1, PHYSIO_METRICS)
-    phys1[c.VIDEO_ID_COL] = phys1['sequence_code'].str.extract(r'video_(\d+)', expand=False).astype(int)
+    phys1 = utils.physio_utils.get_physio_trial_df(
+        df_physio, experiment_setup, c.TRIAL_1, PHYSIO_METRICS
+    )
+    phys1[c.VIDEO_ID_COL] = (
+        phys1['sequence_code'].str.extract(r'video_(\d+)', expand=False).astype(int)
+    )
     df1_physio = df1.merge(
         phys1.drop(columns='sequence_code'), on=[c.PARTICIPANT_ID, c.VIDEO_ID_COL]
     )
-    log.info(f"Physio clips: {len(df1_physio)} from {df1_physio[c.PARTICIPANT_ID].nunique()} participants")
+    log.info(f"Physio clips: {len(df1_physio)}, "
+             f"{df1_physio[c.PARTICIPANT_ID].nunique()} participants")
 
-    # NB - B per metric (same LMM as the ratings) and repeated-measures correlations;
-    # segment_id (presentation slot) absorbs the drift of the signals over the session
+    # NB - B per metric and rm-correlations; segment_id (slot) absorbs drift over the session
     physio_check = []
     for metric in PHYSIO_METRICS:
         model = utils.lmm_utils.run_lmm(
-            df=df1_physio.dropna(subset=[metric]), formula=f"{metric} ~ C(clip_type) + segment_id",
+            df=df1_physio.dropna(subset=[metric]),
+            formula=f"{metric} ~ C(clip_type) + segment_id",
             groups_col='group', vc_formula=random_effects,
             convergence_method=OPT, verbose=False
         )
@@ -292,7 +283,6 @@ def main():
     log.info("Phase 4: Three-segment sequences")
 
     # Positive block: NB off-type segment in a bikeable route
-
     df_positive = utils.helper_utils.load_and_process_trial_data(
         lab_results_df, experiment_setup, lab_seq_df,
         c.TRIAL_3_PARAMS, video_level_scores, 'NB'
@@ -308,7 +298,7 @@ def main():
         save_path=output_dir / 'task3_positive_trends_CI.png'
     )
 
-    # Page's trend test on rankings: recency predicts a late NB segment ranked worst
+    # Page's trend test: recency predicts a late NB segment ranked worst
     page_positive = utils.helper_utils.page_trend_ranking(
         df_positive[df_positive['off_type_position'] != 0],
         subject_col=c.PARTICIPANT_ID, condition_col='off_type_position',
@@ -316,10 +306,9 @@ def main():
     )
     page_positive = pd.DataFrame([page_positive])
     page_positive.to_csv(output_dir / 'task3_positive_ranking_page.csv', index=False)
-    log.info(f"Page's trend test, Positive block:\n{page_positive.round(3).to_string(index=False)}")
+    log.info(f"Page's test, Positive:\n{page_positive.round(3).to_string(index=False)}")
 
     # Negative block: B off-type segment in a non-bikeable route
-
     df_negative = utils.helper_utils.load_and_process_trial_data(
         lab_results_df, experiment_setup, lab_seq_df,
         c.TRIAL_4_PARAMS, video_level_scores, 'B'
@@ -335,7 +324,7 @@ def main():
         save_path=output_dir / 'task3_negative_trends_CI.png'
     )
 
-    # Page's trend test on rankings: recency predicts a late B segment ranked best
+    # Page's trend test: recency predicts a late B segment ranked best
     page_negative = utils.helper_utils.page_trend_ranking(
         df_negative[df_negative['off_type_position'] != 0],
         subject_col=c.PARTICIPANT_ID, condition_col='off_type_position',
@@ -343,7 +332,7 @@ def main():
     )
     page_negative = pd.DataFrame([page_negative])
     page_negative.to_csv(output_dir / 'task3_negative_ranking_page.csv', index=False)
-    log.info(f"Page's trend test, Negative block:\n{page_negative.round(3).to_string(index=False)}")
+    log.info(f"Page's test, Negative:\n{page_negative.round(3).to_string(index=False)}")
 
     # Pooled position model (M2): both blocks together
     df_combined = utils.process_utils.prepare_combined_scenario_df(df_positive, df_negative)
@@ -351,28 +340,28 @@ def main():
     blocks = ('Negative', 'Positive')
     demographic_tests = []
 
-    for OUTCOME in ["valence", "arousal"]:
-        log.info(f"\n{'=' * 50}\n{OUTCOME.upper()}\n{'=' * 50}")
-        covariate = utils.process_utils.add_off_type_covariate(df_combined, OUTCOME)
+    for outcome in [c.VALENCE, c.AROUSAL]:
+        log.info(f"M2: {outcome}")
+        covariate = utils.process_utils.add_off_type_covariate(df_combined, outcome)
 
         # M2: Y ~ position x scenario + off-type intensity + (1 | participant)
-        m2_formula = f"{OUTCOME} ~ C(off_type_position) * C(scenario) + {covariate}"
+        m2_formula = f"{outcome} ~ C(off_type_position) * C(scenario) + {covariate}"
         m2 = utils.lmm_utils.run_lmm(
             df=df_combined, formula=m2_formula,
             groups_col=c.PARTICIPANT_ID, convergence_method=OPT, verbose=False
         )
         utils.plot_utils.plot_lmm_diagnostics(
-            m2, f"M2 ({OUTCOME})", output_dir / f"diagnostics_M2_{OUTCOME}.png"
+            m2, f"M2 ({outcome})", output_dir / f"diagnostics_M2_{outcome}.png"
         )
 
-        # Contrasts as differences between M2's predicted cell means
+        # Contrasts = differences between M2's predicted cell means
         fixed_effects = m2.fe_params.index
         cells = {
             (b, k): utils.lmm_utils.cell_weights(fixed_effects, b, k)
             for b in blocks for k in range(4)
         }
         shift = {(b, k): cells[b, k] - cells[b, 0] for b in blocks for k in (1, 2, 3)}
-        nb_sign = -1 if OUTCOME == c.VALENCE else 1  # NB lowers valence, raises arousal
+        nb_sign = -1 if outcome == c.VALENCE else 1  # NB lowers valence, raises arousal
 
         # Off-type shift from baseline, averaged over positions 1-3 (one Holm family)
         shifts = {
@@ -391,13 +380,13 @@ def main():
             utils.lmm_utils.contrast_table(m2, recency, holm=True),
             utils.lmm_utils.contrast_table(m2, magnitude),
         ]).rename_axis('contrast').reset_index()
-        all_contrasts += contrasts.assign(task='Task 3', outcome=OUTCOME).to_dict('records')
+        all_contrasts += contrasts.assign(task='Task 3', outcome=outcome).to_dict('records')
 
         # Predicted means per block x position (Figure 5)
         emm_df = utils.lmm_utils.contrast_table(m2, cells).rename(columns={'estimate': 'emm'})
-        emm_df = emm_df.rename_axis(['block', 'position']).reset_index().assign(outcome=OUTCOME)
-        emm_df.to_csv(output_dir / f"EMM_table_{OUTCOME}.csv", index=False)
-        utils.plot_utils.plot_emm_interaction(emm_df, OUTCOME, output_dir, log)
+        emm_df = emm_df.rename_axis(['block', 'position']).reset_index().assign(outcome=outcome)
+        emm_df.to_csv(output_dir / f"EMM_table_{outcome}.csv", index=False)
+        utils.plot_utils.plot_emm_interaction(emm_df, outcome, output_dir, log)
 
         # Robustness: does any demographic variable improve M2? (LR test)
         for variable in demo_cols:
@@ -406,7 +395,7 @@ def main():
                 groups_col=c.PARTICIPANT_ID, convergence_method=OPT, verbose=False
             )
             result = utils.helper_utils.lr_test(m2, m2_variable)
-            demographic_tests.append({'outcome': OUTCOME, 'variable': variable, **result})
+            demographic_tests.append({'outcome': outcome, 'variable': variable, **result})
 
     demographic_tests = pd.DataFrame(demographic_tests).drop(columns=['label', 'note'])
     demographic_tests['p_holm'] = demographic_tests.groupby('outcome')['p'].transform(
@@ -422,12 +411,12 @@ def main():
     columns = ['task', 'contrast', 'outcome', 'estimate', 'ci_low', 'ci_high', 'p_report']
     log.info(f"Planned contrasts:\n{all_contrasts[columns].round(3).to_string(index=False)}")
 
-    # Physiology (exploratory): non-bikeable - bikeable block per metric (Holm) and correlations
-    # with the ratings; segment_id (presentation slot) absorbs the drift over the session
+    # Physiology (exploratory): non-bikeable - bikeable block per metric and rm-correlations
     physio_block = []
     for metric in PHYSIO_METRICS:
         model = utils.lmm_utils.run_lmm(
-            df=df_combined.dropna(subset=[metric]), formula=f"{metric} ~ C(scenario) + segment_id",
+            df=df_combined.dropna(subset=[metric]),
+            formula=f"{metric} ~ C(scenario) + segment_id",
             groups_col=c.PARTICIPANT_ID, convergence_method=OPT, verbose=False
         )
         result = utils.lmm_utils.lmm_contrast(model, {'C(scenario)[T.Positive]': -1})
@@ -435,13 +424,14 @@ def main():
     physio_block = pd.DataFrame(physio_block)
     physio_block['p_holm'] = multipletests(physio_block['p'], method='holm')[1]
     physio_block.to_csv(output_dir / 'task3_physio_block_contrast.csv', index=False)
-    log.info(f"Physio non-bikeable - bikeable block:\n{physio_block.round(3).to_string(index=False)}")
+    log.info(f"Physio NB - B block:\n{physio_block.round(3).to_string(index=False)}")
 
     physio_three_corr = utils.helper_utils.rm_corr_table(
-        df_combined, c.PARTICIPANT_ID, PHYSIO_METRICS, [c.VALENCE, c.AROUSAL], control='segment_id'
+        df_combined, c.PARTICIPANT_ID, PHYSIO_METRICS, [c.VALENCE, c.AROUSAL],
+        control='segment_id'
     )
     physio_three_corr.to_csv(output_dir / 'task3_physio_rating_correlations.csv', index=False)
-    log.info(f"Physio-rating correlations (Task 3):\n{physio_three_corr.round(3).to_string(index=False)}")
+    log.info(f"Physio-rating rm-r (Task 3):\n{physio_three_corr.round(3).to_string(index=False)}")
 
     # ==============================================================================
     # PHASE 5: AGGREGATION RULES (Task 3)
@@ -497,7 +487,9 @@ def main():
             weight = utils.lmm_utils.lmm_contrast(sequential, {'a_mean': 1 / 3, 'a_recency': k - 2})
             recency_tests.append({'outcome': outcome, 'term': f'weight_{k}', **weight})
         w1, w3 = recency_tests[-3]['estimate'], recency_tests[-1]['estimate']
-        recency_tests.append({'outcome': outcome, 'term': 'weight_3 / weight_1', 'estimate': w3 / w1})
+        recency_tests.append(
+            {'outcome': outcome, 'term': 'weight_3 / weight_1', 'estimate': w3 / w1}
+        )
 
     rule_fits = pd.DataFrame(rule_fits)
     rule_fits.to_csv(output_dir / 'task3_aggregation_rules.csv', index=False)
