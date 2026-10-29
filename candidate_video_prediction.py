@@ -1,17 +1,15 @@
 import configparser
-from typing import Optional, Tuple
+from typing import Optional
 import numpy as np
 from matplotlib.lines import Line2D
 from scipy.spatial import ConvexHull
-from sklearn.cluster import KMeans
-from sklearn.metrics import root_mean_squared_error
-from sklearn.neighbors import KNeighborsRegressor
 from sklearn.preprocessing import MinMaxScaler
 import sys
 import constants as c
 import utils.helper_utils
 import seaborn as sns
 import utils.process_utils
+from utils.clustering_utils import perform_clustering, compute_k_rmse, predict_candidates
 import logging
 from pathlib import Path
 import pandas as pd
@@ -60,110 +58,6 @@ def _apply_axis_style(ax, title=None, xlabel=None, ylabel=None):
     ax.grid(True, linestyle='--', alpha=STYLE['grid_alpha'])
 
 
-def perform_clustering(video_df, data_cols, cluster_target, corr_list):
-    """
-    Perform KMeans clustering and print cluster compositions and correlations.
-    :param video_df: DataFrame with video data
-    :param data_cols: list of columns to use for clustering
-    :param cluster_target: name of the new cluster column
-    :param corr_list: list of columns to compute correlations with
-    :return: DataFrame with cluster assignments
-    """
-    X = video_df[data_cols].copy()
-    kmeans = KMeans(n_clusters=2, random_state=42)
-    video_df[cluster_target] = kmeans.fit_predict(X)
-
-    # Cluster video composition
-    cluster_videos = video_df.groupby(cluster_target)[c.VIDEO_ID_COL].apply(list)
-    for cluster_label, videos in cluster_videos.items():
-        print(f"\nCluster {cluster_label} contains {len(videos)} videos:")
-        print(videos)
-
-    # Create separate sorted correlation DataFrames
-    for i in corr_list:
-        print(video_df[data_cols].corrwith(video_df[i]).sort_values(ascending=False).to_frame(name=f'{i} corr'))
-        print()
-    return video_df
-
-
-def compute_k_rmse(X, video_df, target_col=c.VALENCE):
-    """
-    Compute RMSE for k-NN predictions across different k values to find the optimal k.
-    :param X: feature DataFrame
-    :param video_df: DataFrame with video data
-    :param target_col: name of the target column
-    :return: DataFrame with RMSE values for each k, best RMSE, and best k
-    """
-    rmses = []
-    for k in range(1, len(X) - 1):
-        preds = []
-        gt = []
-        for vid in X.index:
-            pred = get_neighbor_prediction(X, vid, video_df, k, target_col)
-            preds.append(pred)
-            gt.append(video_df.loc[vid, target_col])
-        rmse_k = root_mean_squared_error(gt, preds)
-        rmses.append(rmse_k)
-
-    rmses_df = (pd.DataFrame({'k': range(1, len(X) - 1), 'rms': rmses})
-                .set_index('k'))
-
-    best_k = rmses_df['rms'].idxmin()
-    best_rmse = rmses_df.loc[best_k, 'rms']
-    print(f"Global best k = {best_k}")
-    print(f"Global best RMSE = {best_rmse}")
-
-    return rmses_df, best_rmse, best_k
-
-
-def predict_candidates(X, video_df, candidate_df, feature_cols, target_col, k,
-                       id_col=c.VIDEO_ID_COL, pred_col='valence_prediction', negate=False):
-    """
-    Predict `target_col` for candidate videos using k-NN trained on existing video data.
-    :param pred_col: name of the output prediction column
-                     (defaults to f"{target_col}_prediction")
-    """
-    pred_col = pred_col or f"{target_col}_prediction"
-    knn = KNeighborsRegressor(n_neighbors=k, weights='distance', metric='manhattan')
-    knn.fit(X, video_df.loc[X.index, target_col])
-
-    rows = []
-    for vid in candidate_df.index:
-        pred = knn.predict(candidate_df.loc[vid, feature_cols].to_frame().T)[0]
-        if negate:
-            pred = -pred
-        rows.append({id_col: candidate_df.loc[vid, id_col], pred_col: pred})
-
-    results_df = (pd.DataFrame(rows)
-                  .sort_values(by=pred_col, ascending=False)
-                  .reset_index(drop=True))
-    return results_df
-
-def get_neighbor_prediction(
-        X: pd.DataFrame,
-        video: str,
-        video_df: pd.DataFrame,
-        k: int,
-        target_col: str = c.VALENCE
-) -> float:
-    """
-    Get k-NN prediction for a specific video.
-    :param X: feature DataFrame
-    :param video: video ID to predict
-    :param video_df: DataFrame with video data
-    :param k: number of neighbors
-    :param target_col: name of the target column
-    :return: predicted value
-    """
-    curr_X = X.drop(index=[video])
-    ratings_X = video_df.loc[curr_X.index, target_col]
-    knn = KNeighborsRegressor(n_neighbors=k, weights='distance', metric='manhattan')
-    knn.fit(curr_X, ratings_X)
-    prediction = knn.predict(X.loc[video, :].to_frame().T)[0]
-
-    return prediction
-
-
 def get_top_labels(df, target_col, label_cols, top_n=5):
     """
     Finds the top correlating survey labels (PF or NF).
@@ -187,32 +81,6 @@ def get_top_labels(df, target_col, label_cols, top_n=5):
         log.info(f" - {row['original_col']} (|r| = {row['abs_corr']:.3f})")
 
     return final_label_cols
-
-
-def filter_by_distance_to_boundary(
-        df: pd.DataFrame,
-        cluster_col: str,
-        valence_col: str,
-        threshold: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, float]:
-    """
-    Retain rows whose valence is at least `threshold` from the cluster boundary
-    (defined as the midpoint between the two cluster centroids in valence).
-
-    Returns (retained, excluded, boundary).
-    """
-    if df[cluster_col].nunique() != 2:
-        raise ValueError(f"Expected 2 clusters in {cluster_col}, got {df[cluster_col].nunique()}.")
-
-    centroids = df.groupby(cluster_col)[valence_col].mean()
-    boundary = float(centroids.mean())
-
-    df = df.copy()
-    df['dist_to_boundary'] = (df[valence_col] - boundary).abs()
-    retained = df[df['dist_to_boundary'] >= threshold].copy()
-    excluded = df[df['dist_to_boundary'] < threshold].copy()
-
-    return retained, excluded, boundary
 
 
 def plot_cluster_separation(
