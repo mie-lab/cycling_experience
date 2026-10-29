@@ -3139,3 +3139,59 @@ def plot_lmm_diagnostics(fitted, title, save_path):
     fig.tight_layout()
     fig.savefig(save_path, dpi=300)
     plt.close(fig)
+
+INDEX_LABELS = {'lts': 'LTS', 'bsl': 'BSL', 'bci': 'BCI', 'blos': 'BLOS',
+                'weikl': 'Weikl &\nMayer', 'netascore': 'NetAScore',
+                'danish_blos': 'Danish-\nBLOS'}
+SEGMENT_COLOURS = {'B': '#2a78d6', 'NB': '#d6492a'}
+
+
+def plot_sequence_rules(seq, indices, value, xlabel, save_path):
+    """
+    Rows = index, columns = block. Baseline line in the block's segment colour,
+    Sequential dots in the off-type segment colour, Average in grey.
+    """
+    blocks = ['bikeable', 'non-bikeable']
+    height = 0.9 * len(indices) + 0.8
+    fig, axes = plt.subplots(len(indices), 2, figsize=(7.5, height), sharex='col')
+
+    for col, block in enumerate(blocks):
+        for row, index in enumerate(indices):
+            ax = axes[row, col]
+            d = seq[(seq['index'] == index) & (seq['block'] == block)]
+            d = d.pivot_table(index=['off_type_position', 'sequence'],
+                              columns='rule', values=value).reset_index()
+            y = np.arange(len(d))[::-1]
+            base, off = ('B', 'NB') if block == 'bikeable' else ('NB', 'B')
+            ax.axvline(0, color=SEGMENT_COLOURS[base], ls='--', lw=1.5,
+                       zorder=1)
+            ax.hlines(y, d['average'], d['sequential'], color='0.7', lw=1.5)
+            ax.scatter(d['average'], y, s=28, color='0.65',
+                       label='Average', zorder=2)
+            ax.scatter(d['sequential'], y, s=28, color=SEGMENT_COLOURS[off],
+                       label='Sequential', zorder=3)
+            ax.set_yticks(y, d['sequence'])
+            ax.set_ylim(y.min() - 0.5, y.max() + 0.5)
+            ax.grid(axis='x', color='0.92')
+            ax.spines[['top', 'right']].set_visible(False)
+            if col == 0:
+                ax.set_ylabel(INDEX_LABELS.get(index, index), fontsize=9)
+        axes[0, col].set_title(f"{block.capitalize()} block", fontsize=11)
+        axes[-1, col].set_xlabel(xlabel)
+
+    def dot(colour):
+        return Line2D([], [], color=colour, marker='o', ls='', markersize=6)
+
+    def dash(colour):
+        return Line2D([], [], color=colour, ls='--', lw=1.5)
+
+    blue, red = SEGMENT_COLOURS['B'], SEGMENT_COLOURS['NB']
+    handles = [dot('0.65'), (dot(red), dot(blue)), (dash(blue), dash(red))]
+    labels = ['Average', 'Sequential (off-type NB / B)',
+              'Baseline (B-B-B / NB-NB-NB)']
+    fig.legend(handles, labels, loc='upper center', ncol=3,
+               frameon=False, fontsize=9,
+               handler_map={tuple: mpl.legend_handler.HandlerTuple(ndivide=None)})
+    fig.tight_layout(rect=(0, 0, 1, 0.965))
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
