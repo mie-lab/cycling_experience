@@ -23,7 +23,7 @@ def main():
 
     survey_results_file = Path(config["filenames"]["survey_results_file"])
     sequence_file = Path(config["filenames"]["online_sequence_file"])
-    output_dir = Path(config['paths']['output_dir'])
+    output_dir = Path(config['paths']['online_survey_output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ==============================================================================

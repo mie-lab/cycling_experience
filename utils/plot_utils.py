@@ -604,6 +604,7 @@ def plot_affect_grid(
             # Construct a unique path for THIS video inside the loop
             filename = f"affect_grid_video_{vid}.png"
             full_path = Path(save_path) / filename
+            full_path.parent.mkdir(parents=True, exist_ok=True)
 
             fig.tight_layout()
             fig.savefig(full_path, dpi=150, bbox_inches='tight')
@@ -3194,4 +3195,103 @@ def plot_sequence_rules(seq, indices, value, xlabel, save_path):
                handler_map={tuple: mpl.legend_handler.HandlerTuple(ndivide=None)})
     fig.tight_layout(rect=(0, 0, 1, 0.965))
     fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+
+# -------------------------------------------------------------------
+# THE DYNAMIC GAP IN BIKEABILITY (dynamic_gap_analysis.py)
+# -------------------------------------------------------------------
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+
+def plot_clip_means_va(df, save_path):
+    """Clip means in valence-arousal space, error bars = SE (Figure 3)."""
+    s = df.groupby(c.VIDEO_ID_COL)[[c.VALENCE, c.AROUSAL]].agg(["mean", "sem"])
+    fig, ax = plt.subplots(figsize=(9, 9))
+    sc = ax.scatter(s["valence", "mean"], s["arousal", "mean"],
+                    c=s["arousal", "mean"] - s["valence", "mean"],
+                    cmap="vlag", s=230, edgecolor="black", linewidth=1.3)
+    ax.errorbar(s["valence", "mean"], s["arousal", "mean"],
+                xerr=s["valence", "sem"], yerr=s["arousal", "sem"],
+                fmt="none", ecolor="gray", elinewidth=1, capsize=3, alpha=0.5)
+    for vid, row in s.iterrows():
+        ax.text(row["valence", "mean"] + 0.02, row["arousal", "mean"] + 0.02, str(vid), fontsize=10)
+    ax.set(xlim=(-1, 1), ylim=(-1, 1), xticks=np.arange(-1, 1.1, 0.2), yticks=np.arange(-1, 1.1, 0.2))
+    ax.axhline(0, color="gray", ls="--", alpha=0.6)
+    ax.axvline(0, color="gray", ls="--", alpha=0.6)
+    ax.grid(True, ls="--", alpha=0.35)
+    ax.set_aspect("equal", adjustable="box")
+    ax.tick_params(labelsize=14)
+    ax.set_xlabel("Mean Valence", fontsize=18)
+    ax.set_ylabel("Mean Arousal", fontsize=18)
+    cbar = plt.colorbar(sc, cax=make_axes_locatable(ax).append_axes("right", size="4%", pad=0.08))
+    cbar.set_label("Affect Grid Scale", fontsize=18)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_r2_scenarios(r2, save_path):
+    """R2 of valence and arousal across the information scenarios (Figure 4)."""
+    cmap = plt.get_cmap("vlag")
+    x = np.arange(len(r2))
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for shift, y, colour in [(-0.175, c.VALENCE, cmap(0.05)), (0.175, c.AROUSAL, cmap(0.95))]:
+        bars = ax.bar(x + shift, r2[y], 0.35, label=y.capitalize(), color=colour)
+        ax.bar_label(bars, fmt="%.2f", fontsize=10, padding=2)
+    ax.set_xticks(x, [f"{m}\n{s}" for m, s in zip(r2["model"], r2["scenario"])], fontsize=10)
+    ax.set_ylabel("Explained variance ($R^2$)", fontsize=12)
+    ax.set_ylim(0, 0.6)
+    ax.grid(axis="y", ls="--", alpha=0.5)
+    ax.legend(fontsize=10, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_spearman_matrix(corr, labels, save_path):
+    """Lower-triangular Spearman correlation matrix (Figure B1)."""
+    names = [labels.get(x, x) for x in corr.columns]
+    fig, ax = plt.subplots(figsize=(18, 14))
+    sns.heatmap(corr, mask=np.triu(np.ones_like(corr, dtype=bool)), annot=True, fmt=".2f",
+                cmap="vlag", vmin=-1, vmax=1, linewidths=0.4, square=True,
+                cbar_kws={"label": "Spearman correlation (ρ)"},
+                xticklabels=names, yticklabels=names, ax=ax)
+    ax.tick_params(length=0, labelsize=12)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_channel_correlations(res, indices, scenarios, save_path):
+    """Spearman correlation of each channel index with valence and arousal (Figure B2)."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    for ax, y in zip(axes, [c.VALENCE, c.AROUSAL]):
+        grid = (res.pivot(index="index", columns="scenario", values=y)
+                .reindex(index=indices, columns=scenarios))
+        sns.heatmap(grid, annot=True, fmt=".2f", cmap="vlag", vmin=-1, vmax=1, linewidths=0.4,
+                    square=True, cbar_kws={"label": "Spearman ρ"}, ax=ax)
+        ax.set(title=f"Correlation with {y.capitalize()}", xlabel="Information scenario", ylabel="")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_top3_bars(res, save_path):
+    """|Spearman rho| of the top-3 feature indices with valence and arousal (Figure B3)."""
+    long = res.melt(id_vars=["scenario", "index"], value_vars=[c.VALENCE, c.AROUSAL],
+                    var_name="outcome", value_name="rho")
+    long["abs_rho"] = long["rho"].abs()
+    cmap = plt.get_cmap("vlag")
+    palette = {"StaticIndex": cmap(0.05), "VisualIndex": "#95A5A6", "DynamicIndex": cmap(0.95)}
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.5), sharey=True)
+    for ax, y in zip(axes, [c.VALENCE, c.AROUSAL]):
+        sns.barplot(long[long["outcome"] == y], x="scenario", y="abs_rho", hue="index",
+                    palette=palette, ax=ax)
+        for bars in ax.containers:
+            ax.bar_label(bars, fmt="%.2f", fontsize=10, padding=2)
+        ax.set(title=f"Index correlation with {y.capitalize()}", xlabel="Information scenario",
+               ylabel="Absolute Spearman correlation ($|\\rho|$)", ylim=(0, 0.85))
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close(fig)

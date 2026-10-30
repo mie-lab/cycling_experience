@@ -311,7 +311,7 @@ def main():
     sequence_file = Path(config["filenames"]["online_sequence_file"])
     predicted_valences_file = Path(config['filenames']['video_predictions_file'])
     ground_truth_file = Path(config["filenames"]["video_info_ground_truth"])
-    output_dir = Path(config['paths']['output_dir'])
+    output_dir = Path(config['paths']['sequence_effects_output_dir'], 'catalogue_extension')
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ==============================================================================

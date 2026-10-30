@@ -33,7 +33,7 @@ def main():
     lab_setup_file = Path(config['filenames']['lab_experiment_setup_file'])
     physio_file = Path(config["filenames"]["physiological_results_file"])
 
-    output_dir = Path(config['paths']['output_dir'])
+    output_dir = Path(config['paths']['sequence_effects_output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
 
     OPT = "powell"
