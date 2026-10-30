@@ -1366,6 +1366,9 @@ def enrich_with_spatial_data(
     manual_labels = pd.read_excel(paths["manual_labels"])
     enriched_geom = enriched_geom.merge(manual_labels, on=c.VIDEO_ID_COL, how='left')
     enriched_geom["motor_vehicle_overtakes_presence"] = enriched_geom["motor_vehicle_overtakes_count"] > 0
+    heavy = ["buses_passing_count", "trams_passing_count", "trucks_passing_count"]
+    if set(heavy) <= set(enriched_geom.columns):
+        enriched_geom["heavy_vehicles_count"] = enriched_geom[heavy].sum(axis=1, min_count=len(heavy))
 
     # --- 3.2 MERGE NEGAR FEATURES ---
     log.info("Enriching with Negar features data...")
@@ -1389,10 +1392,14 @@ def enrich_with_spatial_data(
     ).astype(int)
     enriched_geom = merge_spatial_attribute(buffer_geom, enriched_geom, speed_limits, 'temporegime_technical', 'motorized_traffic_speed_kmh')
 
-    # Tram Lanes: Explicitly read only the necessary column
-    tram_lanes = gpd.read_file(road_network_path, layer='vas.vas_verkehrstraeger_event', columns=['tram_vorhanden'])
-    tram_lanes['tram_vorhanden'] = tram_lanes['tram_vorhanden'].map({'ja': True, 'nein': False})
-    enriched_geom = merge_spatial_attribute(buffer_geom, enriched_geom, tram_lanes, 'tram_vorhanden', 'tram_lane_presence')
+    # Tram and bus lines (GIS). Own names, so they do not collide with the manual
+    # 'tram_lane_presence' / 'bus_lane_presence' labels merged above
+    transit = gpd.read_file(road_network_path, layer='vas.vas_verkehrstraeger_event',
+                            columns=['tram_vorhanden', 'bus_vorhanden'])
+    for col in ['tram_vorhanden', 'bus_vorhanden']:
+        transit[col] = transit[col].map({'ja': True, 'nein': False})
+    enriched_geom = merge_spatial_attribute(buffer_geom, enriched_geom, transit, ['tram_vorhanden', 'bus_vorhanden'],
+                                            ['tram_line_gis', 'bus_line_gis'])
 
     # One-Way Traffic: Read no attribute columns, only geometry
     one_way_lanes = gpd.read_file(road_network_path, layer='vas.vas_einbahn_ist_event', columns=[])
@@ -1400,7 +1407,8 @@ def enrich_with_spatial_data(
 
     # Fill NaNs and explicitly set the final data type for each column individually.
     enriched_geom['motorized_traffic_speed_kmh'] = enriched_geom['motorized_traffic_speed_kmh'].fillna(0).astype(int)
-    enriched_geom['tram_lane_presence'] = enriched_geom['tram_lane_presence'].fillna(False).astype(bool)
+    for col in ['tram_line_gis', 'bus_line_gis']:
+        enriched_geom[col] = enriched_geom[col].fillna(False).astype(bool).astype(int)
 
     # --- 6. MERGE SIDE PARKING ---
     log.info("Enriching with side parking data...")

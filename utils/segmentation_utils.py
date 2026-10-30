@@ -2,8 +2,10 @@ import os
 import logging
 from collections import defaultdict
 from pathlib import Path
-from transformers import pipeline
+# cv2 must be imported before transformers: the other order fails on Windows
+# ("DLL load failed while importing cv2")
 import cv2
+from transformers import pipeline
 import numpy as np
 import pandas as pd
 from moviepy.editor import VideoFileClip

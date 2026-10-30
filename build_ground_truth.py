@@ -5,7 +5,6 @@ from pathlib import Path
 import logging
 import constants as c
 import utils.process_utils
-from utils.segmentation_utils import extract_frames_from_videos, run_semantic_segmentation
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -40,7 +39,10 @@ def main():
     # ==============================================================================
     # 2. GENERATE SEMANTIC FEATURES
     # ==============================================================================
+    # Imported only when frames or segmentation must be (re)computed: the segmentation
+    # stack (OpenCV, moviepy, transformers) is not needed to rebuild the other features
     if not any(d.is_dir() for d in video_dir.iterdir()):
+        from utils.segmentation_utils import extract_frames_from_videos
         log.info("No frame folders found. Extracting frames from videos...")
         extract_frames_from_videos(video_dir, interval_seconds=1)
     else:
@@ -49,6 +51,7 @@ def main():
     # The pipeline is only run if the final results file is missing.
     if not segmentation_results_file.exists():
         log.info(f"Segmentation results file not found. Running the pipeline...")
+        from utils.segmentation_utils import run_semantic_segmentation
         run_semantic_segmentation(config)
     else:
         log.info(f"Segmentation results file found. Skipping segmentation.")
