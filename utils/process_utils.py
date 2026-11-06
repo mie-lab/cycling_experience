@@ -1,5 +1,8 @@
+import json
 import os
-from shapely import LineString
+import requests
+from collections import Counter
+from shapely import LineString, Point
 import geopandas as gpd
 import logging
 from sklearn.mixture import BayesianGaussianMixture, GaussianMixture
@@ -1123,10 +1126,9 @@ def merge_spatial_share(
         edges[target_col] = 0
         return edges
 
-    if edges.geometry.type.iloc[0] == 'LineString':
-        overlaps['overlap'] = overlaps.geometry.length
-    elif edges.geometry.type.iloc[0] == 'Polygon':
-        overlaps['overlap'] = overlaps.geometry.area
+    # Area for polygon layers (e.g. greenery), length for line layers
+    polygons = overlaps.geom_type.isin(['Polygon', 'MultiPolygon']).all()
+    overlaps['overlap'] = overlaps.geometry.area if polygons else overlaps.geometry.length
 
     overlap_sums = overlaps.groupby(merge_col)['overlap'].sum().rename('overlap_sum')
     edges = edges.merge(overlap_sums, on=merge_col, how='left')
@@ -1314,6 +1316,110 @@ def classify_cycleway_row(gdf):
     return gdf_classified
 
 
+def read_mllm_speed(path: Path) -> pd.DataFrame:
+    """MLLM traffic speed estimate (km/h) per video."""
+    with open(path, "r") as f:
+        raw = json.load(f)
+
+    rows = []
+    for filename, features in raw.items():
+        match = re.search(r"_video_(\d+)", filename)
+        if match:
+            rows.append({
+                c.VIDEO_ID_COL: int(match.group(1)),
+                "traffic_speed_mllm_kmh": features.get("motorized_traffic_speed_kmh"),
+            })
+    df = pd.DataFrame(rows)
+    df["traffic_speed_mllm_kmh"] = pd.to_numeric(df["traffic_speed_mllm_kmh"], errors="coerce")
+    return df
+
+
+OSM_URL = "https://overpass-api.de/api/interpreter"
+OSM_MOTOR_ROADS = [
+    "motorway", "trunk", "primary", "secondary", "tertiary", "unclassified", "residential",
+    "living_street", "service", "motorway_link", "trunk_link", "primary_link", "secondary_link",
+    "tertiary_link",
+]
+OSM_WAYS =[f'way["highway"~"^({"|".join(OSM_MOTOR_ROADS + ["busway"])})$"]', 'way["railway"="tram"]']
+OSM_CONTEXT = ['way["building"]', 'node["amenity"]', 'way["amenity"]', 'node["shop"]', 'way["shop"]']
+POI_BUFFER = 50  # m; all other GIS features use c.BUFFER (15 m)
+
+
+def download_osm(video_geom: gpd.GeoDataFrame, path: Path, selectors: list) -> None:
+    """OSM elements around the video traces (+200 m), saved as one Overpass response."""
+    west, south, east, north = video_geom.buffer(200).to_crs(4326).total_bounds
+    bbox = f"{south:.5f},{west:.5f},{north:.5f},{east:.5f}"
+    query = f'[out:json][timeout:180];({"".join(f"{s}({bbox});" for s in selectors)});out tags geom;'
+    response = requests.post(OSM_URL, data={"data": query}, timeout=300,
+                             headers={"User-Agent": "bikeability-study/1.0 (research use)"})
+    response.raise_for_status()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(response.text, encoding="utf-8")
+
+
+def read_osm(path: Path) -> gpd.GeoDataFrame:
+    """OSM elements with their tags as columns: ways as lines, nodes as points."""
+    with open(path, encoding="utf-8") as f:
+        elements = json.load(f)["elements"]
+
+    rows = []
+    for e in elements:
+        if e["type"] == "node":
+            geometry = Point(e["lon"], e["lat"])
+        elif e["type"] == "way" and len(e.get("geometry", [])) > 1:
+            geometry = LineString([(p["lon"], p["lat"]) for p in e["geometry"]])
+        else:
+            continue
+        rows.append({**e.get("tags", {}), "geometry": geometry})
+    return gpd.GeoDataFrame(rows, crs=4326)
+
+
+def osm_intersections(streets: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Points where three or more street segments meet (connected OSM ways share their junction nodes)."""
+    degree = Counter()
+    for line in streets.geometry:
+        coords = list(line.coords)
+        for a, b in zip(coords[:-1], coords[1:]):
+            degree[a] += 1
+            degree[b] += 1
+    points = [Point(xy) for xy, n in degree.items() if n >= 3]
+    return gpd.GeoDataFrame(geometry=points, crs=streets.crs)
+
+
+def _osm_tag(ways, col, pattern):
+    if col not in ways:
+        return pd.Series(False, index=ways.index)
+    return ways[col].fillna("").astype(str).str.contains(pattern, regex=True)
+
+
+def osm_pt_lanes(ways: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """OSM ways with a bus lane (busway, bus/psv lanes) or tram tracks."""
+    bus = _osm_tag(ways, "highway", "^busway$")
+    for col in ["busway", "busway:left", "busway:right", "busway:both"]:
+        bus |= _osm_tag(ways, col, "^(opposite_)?(lane|track)$")
+    for col in [col for col in ways if col.startswith(("lanes:bus", "lanes:psv"))]:
+        bus |= _osm_tag(ways, col, "^[1-9]")
+    for col in [col for col in ways if col.startswith(("bus:lanes", "psv:lanes"))]:
+        bus |= _osm_tag(ways, col, "designated")
+
+    tram = _osm_tag(ways, "railway", "^tram$")
+    return ways[bus | tram]
+
+
+def osm_motor_lanes(roads: gpd.GeoDataFrame) -> pd.Series:
+    """OSM `lanes` minus bus/psv lanes. Streets without the tag count one lane per direction."""
+    def first_number(s):
+        return pd.to_numeric(s.astype(str).str.extract(r"(\d+)", expand=False), errors="coerce")
+
+    lanes = first_number(roads["lanes"])
+    for col in ["lanes:bus", "lanes:psv"]:
+        if col in roads:
+            lanes = lanes - first_number(roads[col]).fillna(0)
+
+    oneway = roads["oneway"].isin(["yes", "-1"])
+    return lanes.fillna(oneway.map({True: 1, False: 2}))
+
+
 def enrich_with_spatial_data(
         video_geom: gpd.GeoDataFrame,
         config: dict
@@ -1342,6 +1448,9 @@ def enrich_with_spatial_data(
         "side_parking": Path(config["filenames"]["side_parking_file"]),
         "tree_canopy": Path(config["filenames"]["tree_canopy_file"]),
         "greenery_share_gis": Path(config["filenames"]["greenery_file"]),
+        "osm_ways": Path(config["filenames"]["osm_ways_file"]),
+        "osm_context": Path(config["filenames"]["osm_context_file"]),
+        "mllm": Path(config["filenames"]["video_info_llm_extraction"]),
     }
 
     # Work on a copy to avoid modifying the original DataFrame
@@ -1369,8 +1478,17 @@ def enrich_with_spatial_data(
     heavy = ["buses_passing_count", "trams_passing_count", "trucks_passing_count"]
     if set(heavy) <= set(enriched_geom.columns):
         enriched_geom["heavy_vehicles_count"] = enriched_geom[heavy].sum(axis=1, min_count=len(heavy))
+        # Buses and trucks are part of the vehicle count (trams are not)
+        enriched_geom["light_vehicles_count"] = (
+            enriched_geom["unique_motor_vehicles_count"]
+            - enriched_geom["buses_passing_count"]
+            - enriched_geom["trucks_passing_count"]
+        )
 
-    # --- 3.2 MERGE NEGAR FEATURES ---
+    # --- 3.2 MERGE MLLM TRAFFIC SPEED (no manual speed label exists) ---
+    enriched_geom = enriched_geom.merge(read_mllm_speed(paths["mllm"]), on=c.VIDEO_ID_COL, how='left')
+
+    # --- 3.3 MERGE NEGAR FEATURES ---
     log.info("Enriching with Negar features data...")
     negar_features = pd.read_csv(paths["negar_features"])
     enriched_geom = enriched_geom.merge(negar_features, on=c.VIDEO_ID_COL, how='left')
@@ -1378,8 +1496,12 @@ def enrich_with_spatial_data(
     # --- 4. MERGE TRAFFIC VOLUME ---
     log.info("Enriching with traffic volume data...")
     traffic_volume = gpd.read_file(paths["traffic_volume"])
-    enriched_geom = merge_spatial_attribute(buffer_geom, enriched_geom, traffic_volume, 'AADT_all_veh', 'traffic_volume')
+    trucks = ['AADT_truck_veh', 'AADT_articulated_truck_veh']
+    enriched_geom = merge_spatial_attribute(buffer_geom, enriched_geom, traffic_volume, ['AADT_all_veh'] + trucks,
+                                            ['traffic_volume'] + trucks)
     enriched_geom['traffic_volume'] = enriched_geom['traffic_volume'].fillna(0)
+    enriched_geom['heavy_traffic_volume'] = enriched_geom[trucks].fillna(0).sum(axis=1)
+    enriched_geom = enriched_geom.drop(columns=trucks)
 
     # --- 5. MERGE ROAD NETWORK FEATURES (SPEED, TRAMS, ONE-WAY) ---
     log.info("Enriching with road network features (speed, trams, one-way)...")
@@ -1424,6 +1546,40 @@ def enrich_with_spatial_data(
     greenery = gpd.read_file(paths["greenery_share_gis"])
     enriched_geom = merge_spatial_share(buffer_geom, enriched_geom, greenery, 'greenery_share_gis', 'buff_area',
                                         percent=True)
+
+    # --- 8. MERGE OSM STREET LAYOUT (PUBLIC TRANSPORT LANES, MOTORISED LANES) ---
+    log.info("Enriching with OSM street layout...")
+    if not paths["osm_ways"].exists():
+        download_osm(video_geom, paths["osm_ways"], OSM_WAYS)
+    osm_ways = read_osm(paths["osm_ways"]).to_crs(buffer_geom.crs)
+    pt_lanes = osm_pt_lanes(osm_ways)
+    enriched_geom = merge_spatial_boolean(buffer_geom, enriched_geom, pt_lanes[['geometry']], 'pt_lane_osm', 'length',
+                                          threshold=20)
+    enriched_geom['pt_lane_osm'] = enriched_geom['pt_lane_osm'].astype(int)
+
+    roads = osm_ways[osm_ways['highway'].isin(OSM_MOTOR_ROADS)].copy()
+    roads['car_lanes_osm'] = osm_motor_lanes(roads)
+    enriched_geom = merge_spatial_attribute(buffer_geom, enriched_geom, roads[['car_lanes_osm', 'geometry']],
+                                            'car_lanes_osm')
+    enriched_geom['car_lanes_osm'] = enriched_geom['car_lanes_osm'].fillna(0)  # no motor road along the trace
+
+    # --- 9. MERGE OSM COUNTS (INTERSECTIONS, BUILDINGS, POINTS OF INTEREST) ---
+    log.info("Enriching with OSM intersections, buildings and points of interest...")
+    streets = roads[roads['highway'] != 'service']  # driveways and parking aisles are not street junctions
+    enriched_geom = merge_spatial_count(buffer_geom, enriched_geom, osm_intersections(streets),
+                                        'intersection_count_osm')
+
+    if not paths["osm_context"].exists():
+        download_osm(video_geom, paths["osm_context"], OSM_CONTEXT)
+    context = read_osm(paths["osm_context"]).to_crs(buffer_geom.crs)
+    buildings = context[_osm_tag(context, 'building', '.') & (context.geom_type == 'LineString')]  # outlines
+    pois = context[_osm_tag(context, 'amenity', '.') | _osm_tag(context, 'shop', '.')].copy()
+    pois['geometry'] = pois.geometry.centroid  # one point per POI, also for mapped areas
+    enriched_geom = merge_spatial_count(buffer_geom, enriched_geom, buildings[['geometry']], 'building_count_osm')
+
+    # POIs generate activity from around the block, not only from the street itself
+    poi_buffer = calculate_buffer(video_geom, POI_BUFFER)
+    enriched_geom = merge_spatial_count(poi_buffer, enriched_geom, pois[['geometry']], 'pois_count_osm')
 
     log.info("Spatial data enrichment process finished successfully.")
     return enriched_geom

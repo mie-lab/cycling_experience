@@ -12,7 +12,6 @@ from statsmodels.stats.multitest import multipletests
 
 import constants as c
 
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 INDICES = ["StaticIndex", "VisualIndex", "DynamicIndex"]
@@ -57,25 +56,19 @@ def pc1_index(df, cols, ref):
     return score, sign * loadings, pca.explained_variance_ratio_[0]
 
 
-def channel_indices(df, channels, scenario):
+def channel_indices(df, channels):
     """The three channel indices of one scenario and their interactions, all centred
     within participant."""
     d = df.copy()
-    loadings = []
     for name, (cols, ref) in zip(INDICES, channels):
-        d[name], load, var = pc1_index(d, cols, ref)
-        for f in cols:
-            loadings.append({
-                "scenario": scenario, "index": name, "feature": f,
-                "loading": load[f], "variance_explained": var,
-            })
+        d[name] = pc1_index(d, cols, ref)[0]
 
     d[INDICES] = centre(d, INDICES)
     d["Static_x_Dynamic"] = d["StaticIndex"] * d["DynamicIndex"]
     d["Visual_x_Dynamic"] = d["VisualIndex"] * d["DynamicIndex"]
     d["Static_x_Visual"] = d["StaticIndex"] * d["VisualIndex"]
     d[list(INTERACTIONS.values())] = centre(d, list(INTERACTIONS.values()))
-    return d, loadings
+    return d
 
 
 # -------------------------------------------------------------------
@@ -126,18 +119,18 @@ def fit_indices(model):
 
 def fit_path_model(desc, data):
     """Fit a path model with semopy (ML). Each equation is refitted with OLS for R2 and
-    clip-clustered standard errors. Returns paths, R2, residuals and fit indices."""
+    clip-clustered standard errors. Returns paths, R2 and fit indices."""
     model = Model(desc)
     model.fit(data)
     est = model.inspect(std_est=True)
     paths = est.loc[est["op"] == "~", ["lval", "rval", "Estimate", "Est. Std"]].reset_index(drop=True)
 
-    r2, resid, rows = {}, {}, []
+    r2, rows = {}, []
     for y, grp in paths.groupby("lval", sort=False):
         fit = ols(f"{y} ~ {' + '.join(grp['rval'])}", data).fit(
             cov_type="cluster", cov_kwds={"groups": data[c.VIDEO_ID_COL]}, use_t=True
         )
-        r2[y], resid[y] = fit.rsquared, fit.resid
+        r2[y] = fit.rsquared
         for x in grp["rval"]:
             rows.append({
                 "lval": y, "rval": x,
@@ -149,30 +142,7 @@ def fit_path_model(desc, data):
     if gap > 1e-3:
         log.warning(f"semopy and OLS estimates differ by up to {gap:.4f}")
 
-    return paths, r2, pd.DataFrame(resid), fit_indices(model)
-
-
-def joint_static_test(data, outcomes):
-    """Clip-clustered F-test that StaticIndex has no path to any outcome (M5 vs M4),
-    with the outcome equations stacked."""
-    long = pd.concat([data.assign(_y=data[y], _out=y) for y in outcomes], ignore_index=True)
-    rhs = " + ".join(f"C(_out):{x}" for x in INDICES)
-    fit = ols(f"_y ~ 0 + C(_out) + {rhs}", long).fit(
-        cov_type="cluster", cov_kwds={"groups": long[c.VIDEO_ID_COL]}, use_t=True
-    )
-
-    names = list(fit.params.index)
-    R = np.zeros((len(outcomes), len(names)))
-    for i, y in enumerate(outcomes):
-        R[i, names.index(f"C(_out)[{y}]:StaticIndex")] = 1
-
-    test = fit.f_test(R)
-    return {
-        "F": float(np.squeeze(test.fvalue)),
-        "df_num": int(test.df_num),
-        "df_denom": int(test.df_denom),
-        "p": float(test.pvalue),
-    }
+    return paths, r2, fit_indices(model)
 
 
 def holm(p):
@@ -203,37 +173,6 @@ def loco_errors(X, y, clips):
         beta = np.linalg.lstsq(X[~test], y[~test], rcond=None)[0]
         pred[test] = X[test] @ beta
     return (y - pred) ** 2
-
-
-def heldout_gain(d, y, base, gis, ground, n_boot=2000, seed=1):
-    """Held-out R2 with the GIS version, the ground-level version or both, and the gain
-    of adding the other version. CIs resample clips."""
-    clips = d[c.VIDEO_ID_COL].to_numpy()
-    ids = np.unique(clips)
-    draws = np.random.default_rng(seed).integers(0, len(ids), (n_boot, len(ids)))
-    t = d[y].to_numpy()
-
-    def per_clip(errors):
-        return pd.Series(errors).groupby(clips).sum().reindex(ids).to_numpy()
-
-    sst = per_clip((t - t.mean()) ** 2)
-    sse = {
-        name: per_clip(loco_errors(d[base + cols].to_numpy(), t, clips))
-        for name, cols in [("gis", gis), ("ground", ground), ("both", gis + ground)]
-    }
-    r2 = {f"cv_r2_{k}": 1 - v.sum() / sst.sum() for k, v in sse.items()}
-
-    rows = []
-    for test, single in [("ground beyond GIS", "gis"), ("GIS beyond ground", "ground")]:
-        diff = sse[single] - sse["both"]
-        boot = diff[draws].sum(axis=1) / sst[draws].sum(axis=1)
-        rows.append({
-            "test": test, **r2,
-            "delta_cv_r2": diff.sum() / sst.sum(),
-            "ci_low": np.quantile(boot, .025),
-            "ci_high": np.quantile(boot, .975),
-        })
-    return rows
 
 
 def heldout_comparison(X_a, X_b, t, clips, n_boot=2000, seed=1):

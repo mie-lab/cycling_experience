@@ -3205,7 +3205,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 
 def plot_clip_means_va(df, save_path):
-    """Clip means in valence-arousal space, error bars = SE (Figure 3)."""
+    """Clip means in valence-arousal space, error bars = SE."""
     s = df.groupby(c.VIDEO_ID_COL)[[c.VALENCE, c.AROUSAL]].agg(["mean", "sem"])
     fig, ax = plt.subplots(figsize=(9, 9))
     sc = ax.scatter(s["valence", "mean"], s["arousal", "mean"],
@@ -3232,7 +3232,7 @@ def plot_clip_means_va(df, save_path):
 
 
 def plot_r2_scenarios(r2, save_path):
-    """R2 of valence and arousal across the information scenarios (Figure 4)."""
+    """R2 of valence and arousal across the information scenarios."""
     cmap = plt.get_cmap("vlag")
     x = np.arange(len(r2))
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -3250,7 +3250,7 @@ def plot_r2_scenarios(r2, save_path):
 
 
 def plot_spearman_matrix(corr, labels, save_path):
-    """Lower-triangular Spearman correlation matrix (Figure B1)."""
+    """Lower-triangular Spearman correlation matrix."""
     names = [labels.get(x, x) for x in corr.columns]
     fig, ax = plt.subplots(figsize=(18, 14))
     sns.heatmap(corr, mask=np.triu(np.ones_like(corr, dtype=bool)), annot=True, fmt=".2f",
@@ -3263,22 +3263,8 @@ def plot_spearman_matrix(corr, labels, save_path):
     plt.close(fig)
 
 
-def plot_channel_correlations(res, indices, scenarios, save_path):
-    """Spearman correlation of each channel index with valence and arousal (Figure B2)."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
-    for ax, y in zip(axes, [c.VALENCE, c.AROUSAL]):
-        grid = (res.pivot(index="index", columns="scenario", values=y)
-                .reindex(index=indices, columns=scenarios))
-        sns.heatmap(grid, annot=True, fmt=".2f", cmap="vlag", vmin=-1, vmax=1, linewidths=0.4,
-                    square=True, cbar_kws={"label": "Spearman ρ"}, ax=ax)
-        ax.set(title=f"Correlation with {y.capitalize()}", xlabel="Information scenario", ylabel="")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-
 def plot_top3_bars(res, save_path):
-    """|Spearman rho| of the top-3 feature indices with valence and arousal (Figure B3)."""
+    """|Spearman rho| of the top-3 feature indices with valence and arousal."""
     long = res.melt(id_vars=["scenario", "index"], value_vars=[c.VALENCE, c.AROUSAL],
                     var_name="outcome", value_name="rho")
     long["abs_rho"] = long["rho"].abs()
